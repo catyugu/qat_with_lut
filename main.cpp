@@ -8,10 +8,16 @@
 #include <chrono>   // For timing
 #include <iomanip>  // For formatting the output table
 #include <numeric>  // For std::iota and std::accumulate
+
+// Revert to AVX2 definition
 #define __AVX2__
 #ifdef __AVX2__
 #include <immintrin.h> // For AVX2 intrinsics
 #endif
+
+// Include the new bit-slice kernel and preprocessor headers
+#include "bit_slice_kernels.h" // This header now declares avx2_bit_slice_gemm_kernel
+#include "model_preproc.h"
 
 // --- Data Structures for our Models ---
 struct FloatLayer {
@@ -19,32 +25,29 @@ struct FloatLayer {
     std::vector<float> bias;
 };
 
-// Our LUT-based layer will use quantized weights and an activation scale
+// Our LUT-based layer will use packed quantized weights and an activation scale
 struct LutLayer {
-    std::vector<int8_t> weights; // Ternary {-1, 0, 1}
+    std::vector<uint8_t> packed_weights; // Changed to uint8_t for packed 5x3bit weights
     std::vector<float> bias;
     float activation_scale = 1.0f; // Scale for the *input* activations to this layer
 };
 
-// --- Helper Functions ---
+// Struct for Weights-Only Quantization (unpacked int8_t ternary weights)
+struct WeightsOnlyQuantLayer {
+    std::vector<int8_t> weights; // Unpacked ternary weights {-1, 0, 1}
+    std::vector<float> bias;
+    float activation_scale = 1.0f; // Scale for input activations
+};
 
-// Quantizes float weights to {-1, 0, 1} (Not used for loading, but kept for consistency with training concept)
-void quantize_weights_to_ternary(const std::vector<float>& float_weights, std::vector<int8_t>& ternary_weights) {
-    ternary_weights.resize(float_weights.size());
-    for (size_t i = 0; i < float_weights.size(); ++i) {
-        if (float_weights[i] > 0.1f)      ternary_weights[i] = 1;
-        else if (float_weights[i] < -0.1f) ternary_weights[i] = -1;
-        else                              ternary_weights[i] = 0;
-    }
-}
 
-// Quantizes float_ptr to int_ptr using a *provided* fixed_scale.
-// Takes raw pointers and size to avoid vector slicing/copying overhead.
-void quantize_float_to_int8_with_scale(const float* float_ptr, int8_t* int_ptr, size_t size, float fixed_scale) {
-    for (size_t i = 0; i < size; ++i) {
-        auto val = static_cast<int32_t>(roundf(float_ptr[i] * fixed_scale));
-        int_ptr[i] = static_cast<int8_t>(std::max(-128, std::min(127, val)));
-    }
+// C++ 端用于将 int8_t 值转换为三值 (-1, 0, 1) 的阈值。
+// 对应 Python 中 TERNARY_THRESHOLD (0.01) * 127.0 = 1.27, 四舍五入为 1
+const int8_t C_TERNARY_ACTIVATION_THRESHOLD = 1;
+
+inline int8_t convert_int8_to_ternary_activation(int8_t val) {
+    if (val > C_TERNARY_ACTIVATION_THRESHOLD) return 1;
+    if (val < -C_TERNARY_ACTIVATION_THRESHOLD) return -1;
+    return 0; // Values within [-THRESHOLD, THRESHOLD] map to 0
 }
 
 
@@ -64,81 +67,105 @@ static inline int hsum_i32_8(const __m256i a) {
 #endif
 
 // The high-performance LUT-based forward pass (pure integer math)
-// Optimized for ternary weights using AVX2 intrinsics (if enabled).
-// This version handles a batch of inputs.
-void lut_linear_forward(const LutLayer& layer, const std::vector<int8_t>& input_i8_batched, std::vector<float>& output_f32_batched, int input_dim, int output_dim, int batch_size) {
+// Optimized for ternary weights using AVX2 intrinsics.
+// This version handles a batch of inputs and uses the global LUT.
+void lut_linear_forward(
+    const LutLayer& layer,
+    const std::vector<uint8_t>& input_packed_batched, // Changed to uint8_t for packed activations
+    std::vector<float>& output_f32_batched,
+    int input_dim,  // This is the dimension in original elements, needed for looping
+    int output_dim,
+    int batch_size,
+    const int16_t* precomputed_lut_ptr // Pass the global LUT pointer
+) {
     output_f32_batched.resize(batch_size * output_dim);
-    // The dequant_scale for this layer is pre-set in layer.activation_scale
-    // which comes from the model file (or fixed for input layer).
 
     // Pointers to raw data for efficient access
-    const int8_t* weights_ptr = layer.weights.data();
+    const uint8_t* weights_packed_ptr = layer.packed_weights.data(); // Access packed weights
+
+    // Number of packed bytes per input sample
+    const int packed_input_bytes_per_sample = (input_dim + 4) / 5;
 
     // Iterate over each item in the batch
     for (int b = 0; b < batch_size; ++b) {
-        const int8_t* current_batch_input_ptr = input_i8_batched.data() + b * input_dim;
+        const uint8_t* current_batch_input_packed_ptr = input_packed_batched.data() + b * packed_input_bytes_per_sample;
 
         // Loop over each output neuron (rows of the weight matrix)
+        for (int i = 0; i < output_dim; ++i) {
+            // Get pointer to the packed weights for the current output neuron
+            const uint8_t* current_neuron_weights_packed_ptr = weights_packed_ptr + i * packed_input_bytes_per_sample;
+
+            // Call the AVX2 specific kernel
+#ifdef __AVX2__
+            int32_t sum = avx2_bit_slice_gemm_kernel( // Call AVX2 specific kernel
+                current_batch_input_packed_ptr,
+                current_neuron_weights_packed_ptr,
+                precomputed_lut_ptr,
+                input_dim // Pass the original (padded) dimension. Kernel uses this to know total elements.
+            );
+#else
+            // Fallback to scalar (non-AVX) if AVX2 is not enabled
+            int32_t sum = 0;
+            // A simple scalar fallback for testing (not optimized)
+            for (int k_idx = 0; k_idx < input_dim; k_idx += 5) {
+                uint8_t packed_act = current_batch_input_packed_ptr[k_idx / 5];
+                uint8_t packed_weight = current_neuron_weights_packed_ptr[k_idx / 5];
+                sum += precomputed_lut_ptr[(static_cast<uint32_t>(packed_act) << 8) | packed_weight];
+            }
+#endif
+
+            // Dequantize the final integer sum back to float and add the bias
+            output_f32_batched[b * output_dim + i] = (static_cast<float>(sum) / layer.activation_scale) + layer.bias[i];
+        }
+    }
+}
+
+// Forward pass for Weights-Only Quantization (int8_t activations, int8_t ternary weights)
+// This uses unpacked int8_t weights and does not use the 5x3 bit packing or the LUT.
+void weights_only_linear_forward(const WeightsOnlyQuantLayer& layer, const std::vector<int8_t>& input_i8_batched, std::vector<float>& output_f32_batched, int input_dim, int output_dim, int batch_size) {
+    output_f32_batched.resize(batch_size * output_dim);
+    const int8_t* weights_ptr = layer.weights.data();
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int8_t* current_batch_input_ptr = input_i8_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
             int32_t sum = 0;
             const int8_t* current_neuron_weights_ptr = weights_ptr + i * input_dim;
 
 #ifdef __AVX2__
-            // Use AVX2 for vectorized processing
-            __m256i accumulated_sum_vec_32 = _mm256_setzero_si256(); // Accumulate sums in 32-bit integers
+            __m256i accumulated_sum_vec_32 = _mm256_setzero_si256();
 
-            // Process input and weights in chunks of 64 int8_t elements
-            // (two __m256i registers, each holding 32 int8_t elements)
-            // This assumes input_dim is a multiple of 64 for optimal performance in this loop.
-            // For real-world robustness, handle the remainder if input_dim is not perfectly divisible by 64.
-            for (int j = 0; j < input_dim; j += 64) {
-                // Load first 32 input activations
-                __m256i input_vals0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_batch_input_ptr + j));
-                // Load second 32 input activations
-                __m256i input_vals1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_batch_input_ptr + j + 32));
+            // Process input and weights in chunks of 32 int8_t elements (one __m256i register)
+            // Assumes input_dim is a multiple of 32 for optimal vectorization.
+            for (int j = 0; j < input_dim; j += 32) {
+                __m256i input_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_batch_input_ptr + j));
+                __m256i weights_block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_neuron_weights_ptr + j));
 
-                // Load first 32 weights
-                __m256i weights_block0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_neuron_weights_ptr + j));
-                // Load second 32 weights
-                __m256i weights_block1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_neuron_weights_ptr + j + 32));
+                // Perform ternary multiplication: _mm256_sign_epi8(a, b) computes a * sign(b)
+                // Since weights are -1, 0, 1, this directly gives the product.
+                __m256i partial_products_i8 = _mm256_sign_epi8(input_vals, weights_block);
 
-                // Perform ternary multiplication for first 32 elements
-                __m256i partial_products0_i8 = _mm256_sign_epi8(input_vals0, weights_block0);
-                // Perform ternary multiplication for second 32 elements
-                __m256i partial_products1_i8 = _mm256_sign_epi8(input_vals1, weights_block1);
+                // Convert 8-bit partial products to 16-bit for accumulation
+                // Extract lower and upper 128-bit lanes and sign-extend to 16-bit.
+                __m256i partial_sums_lo_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products_i8, 0));
+                __m256i partial_sums_hi_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products_i8, 1));
 
-                // Convert 8-bit partial products to 16-bit for accumulation (from partial_products0_i8)
-                __m256i partial_sums0_lo_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products0_i8, 0)); // First 16 int8_t -> 16 int16_t
-                __m256i partial_sums0_hi_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products0_i8, 1)); // Next 16 int8_t -> 16 int16_t
-
-                // Convert 8-bit partial products to 16-bit for accumulation (from partial_products1_i8)
-                __m256i partial_sums1_lo_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products1_i8, 0));
-                __m256i partial_sums1_hi_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products1_i8, 1));
-
-                // Accumulate all 16-bit sums into the 32-bit sum vector
-                // Each _mm256_madd_epi16 converts 16 int16_t values into 8 int32_t sums.
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums0_lo_16, _mm256_set1_epi16(1)));
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums0_hi_16, _mm256_set1_epi16(1)));
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums1_lo_16, _mm256_set1_epi16(1)));
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums1_hi_16, _mm256_set1_epi16(1)));
+                // Accumulate 16-bit sums into 32-bit sum vector
+                // _mm256_madd_epi16 performs pairwise products and horizontal sum of pairs.
+                // We want to sum all 16-bit values. A common way is to multiply by 1 and sum.
+                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums_lo_16, _mm256_set1_epi16(1)));
+                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums_hi_16, _mm256_set1_epi16(1)));
             }
-
-            // Horizontal sum of the 8 int32_t values in accumulated_sum_vec_32
-            // to get the final total sum for the current output neuron.
-            sum = hsum_i32_8(accumulated_sum_vec_32);
-
-#else // Fallback to scalar (non-AVX2) implementation if AVX2 is not enabled
+            sum = hsum_i32_8(accumulated_sum_vec_32); // Use AVX2 horizontal sum
+#else // Fallback to scalar (non-AVX) if AVX2 is not enabled
             for (int j = 0; j < input_dim; ++j) {
-                // This is the original conditional addition/subtraction logic
                 if (current_neuron_weights_ptr[j] == 1) {
                     sum += current_batch_input_ptr[j];
                 } else if (current_neuron_weights_ptr[j] == -1) {
                     sum -= current_batch_input_ptr[j];
                 }
-                // If weight is 0, sum remains unchanged.
             }
 #endif
-            // Dequantize the final integer sum back to float and add the bias
             output_f32_batched[b * output_dim + i] = (static_cast<float>(sum) / layer.activation_scale) + layer.bias[i];
         }
     }
@@ -172,9 +199,9 @@ void log_softmax(float* vec_ptr, size_t size) {
     if (size == 0) return;
     float max_val = vec_ptr[0];
     for (size_t i = 0; i < size; ++i) if (vec_ptr[i] > max_val) max_val = vec_ptr[i];
-    double sum = 0.0;
+    float sum = 0.0f;
     for (size_t i = 0; i < size; ++i) sum += std::exp(vec_ptr[i] - max_val);
-    double log_sum = std::log(sum);
+    float log_sum = std::log(sum);
     for (size_t i = 0; i < size; ++i) vec_ptr[i] = (vec_ptr[i] - max_val) - log_sum;
 }
 
@@ -208,67 +235,182 @@ bool load_labels_from_file(const std::string& path, std::vector<int>& labels, in
     return file.good();
 }
 
+// Function to load full precision MLP from binary file
+bool load_full_precision_mlp(const std::string& path, FloatLayer& layer1, FloatLayer& layer2, int input_dim_padded, int hidden_dim, int output_dim) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::cerr << "Error: Cannot open full precision model file: " << path << std::endl;
+        return false;
+    }
+    char magic[4]; file.read(magic, 4);
+    if (std::string(magic, 4) != "MLPF") { // Check for 'MLPF' magic
+        std::cerr << "Error: Invalid full precision model file format. Expected 'MLPF'." << std::endl;
+        return false;
+    }
+    int file_input_dim, file_hidden_dim, file_output_dim;
+    file.read(reinterpret_cast<char*>(&file_input_dim), sizeof(int));
+    file.read(reinterpret_cast<char*>(&file_hidden_dim), sizeof(int));
+    file.read(reinterpret_cast<char*>(&file_output_dim), sizeof(int));
+
+    if (file_input_dim != 784 || file_hidden_dim != hidden_dim || file_output_dim != output_dim) {
+        std::cerr << "Error: Full precision model dimensions mismatch. Expected " << 784 << "x" << hidden_dim << "x" << output_dim
+                  << ", got " << file_input_dim << "x" << file_hidden_dim << "x" << file_output_dim << std::endl;
+        return false;
+    }
+
+    // Load Layer 1 weights and bias
+    layer1.weights.resize(file_input_dim * hidden_dim);
+    file.read(reinterpret_cast<char*>(layer1.weights.data()), layer1.weights.size() * sizeof(float));
+    layer1.bias.resize(hidden_dim);
+    file.read(reinterpret_cast<char*>(layer1.bias.data()), layer1.bias.size() * sizeof(float));
+
+    // Skip activation scales (2 floats)
+    float dummy_scale;
+    file.read(reinterpret_cast<char*>(&dummy_scale), sizeof(float));
+    file.read(reinterpret_cast<char*>(&dummy_scale), sizeof(float));
+
+    // Load Layer 2 weights and bias
+    layer2.weights.resize(hidden_dim * output_dim);
+    file.read(reinterpret_cast<char*>(layer2.weights.data()), layer2.weights.size() * sizeof(float));
+    layer2.bias.resize(output_dim);
+    file.read(reinterpret_cast<char*>(layer2.bias.data()), layer2.bias.size() * sizeof(float));
+
+    // Handle padding for input_dim_padded if necessary for the float model.
+    // The loaded weights from mlp_model_float.bin are for original 784 dim.
+    // We need to expand them to 960 with zeros.
+    std::vector<float> temp_w1_float = layer1.weights; // Copy original 784x320 weights
+    layer1.weights.assign(hidden_dim * input_dim_padded, 0.0f); // Resize to padded, init to 0
+    for(int i = 0; i < hidden_dim; ++i) {
+        std::copy(temp_w1_float.begin() + i * file_input_dim,
+                  temp_w1_float.begin() + (i + 1) * file_input_dim,
+                  layer1.weights.begin() + i * input_dim_padded);
+    }
+
+    return file.good();
+}
+
+
 int main() {
     try {
-        // --- 1. Load Model Weights from File ---
-        std::ifstream file("mlp_model_aq.bin", std::ios::binary);
-        if (!file) { throw std::runtime_error("Failed to open mlp_model_aq.bin. Please run the updated convert.py first."); }
-        char magic[4]; file.read(magic, 4);
-        if (std::string(magic, 4) != "MLP3") { throw std::runtime_error("Invalid model file format."); }
-        int input_dim, hidden_dim, output_dim;
-        file.read(reinterpret_cast<char*>(&input_dim), sizeof(int));
-        file.read(reinterpret_cast<char*>(&hidden_dim), sizeof(int));
-        file.read(reinterpret_cast<char*>(&output_dim), sizeof(int));
+        // --- Dimensions from the QAT model file ---
+        // These dimensions will be used consistently across all models for comparison
+        int input_dim_original = 784; // Fixed original input dimension
+        int hidden_dim = 320;
+        int output_dim = 10;
+        const int input_dim_padded = 960; // Fixed padded input dimension
 
-        // Read Layer 1 (fc1) weights (now int8_t)
-        std::vector<int8_t> w1_int8(input_dim * hidden_dim);   file.read(reinterpret_cast<char*>(w1_int8.data()), w1_int8.size() * sizeof(int8_t));
-        std::vector<float> b1(hidden_dim);                    file.read(reinterpret_cast<char*>(b1.data()), b1.size() * sizeof(float));
-
-        // Read Activation Scales (two of them now)
-        float input_to_fc1_scale;                             file.read(reinterpret_cast<char*>(&input_to_fc1_scale), sizeof(float)); // Scale for input to first layer
-        float input_to_fc2_scale;                             file.read(reinterpret_cast<char*>(&input_to_fc2_scale), sizeof(float)); // Scale for input to second layer
-
-        // Read Layer 2 (fc2) weights (now int8_t)
-        std::vector<int8_t> w2_int8(hidden_dim * output_dim); file.read(reinterpret_cast<char*>(w2_int8.data()), w2_int8.size() * sizeof(int8_t));
-        std::vector<float> b2(output_dim);                    file.read(reinterpret_cast<char*>(b2.data()), b2.size() * sizeof(float));
-
-        std::cout << "Model loaded successfully." << std::endl;
-        std::cout << "Input Dim: " << input_dim << ", Hidden Dim: " << hidden_dim << ", Output Dim: " << output_dim << std::endl;
-        std::cout << "Activation scale for input to first layer: " << input_to_fc1_scale << std::endl;
-        std::cout << "Activation scale for input to second layer: " << input_to_fc2_scale << std::endl;
+        if (input_dim_original > input_dim_padded) {
+             throw std::runtime_error("Original input dimension is larger than padded dimension.");
+        }
+        if (input_dim_padded % 160 != 0) {
+            throw std::runtime_error("Padded input dimension must be a multiple of 160 for AVX2 kernel.");
+        }
+        if (hidden_dim % 160 != 0) {
+            throw std::runtime_error("Hidden dimension must be a multiple of 160 for AVX2 kernel.");
+        }
 
 
-        // --- 2. Prepare Both Models ---
+        // --- 1. Load Model Weights for LUT and Weights-Only Quantized MLPs ---
+        // These are loaded from mlp_model_aq.bin (QAT trained model)
+        std::ifstream qat_model_file("mlp_model_aq.bin", std::ios::binary);
+        if (!qat_model_file) { throw std::runtime_error("Failed to open mlp_model_aq.bin. Please run convert.py first."); }
+        char magic_qat[4]; qat_model_file.read(magic_qat, 4);
+        if (std::string(magic_qat, 4) != "MLP3") { throw std::runtime_error("Invalid QAT model file format."); }
+        int qat_input_dim, qat_hidden_dim, qat_output_dim;
+        qat_model_file.read(reinterpret_cast<char*>(&qat_input_dim), sizeof(int));
+        qat_model_file.read(reinterpret_cast<char*>(&qat_hidden_dim), sizeof(int));
+        qat_model_file.read(reinterpret_cast<char*>(&qat_output_dim), sizeof(int));
+
+        // Read Layer 1 (fc1) weights (int8_t from file)
+        std::vector<int8_t> w1_int8_unpacked(qat_input_dim * qat_hidden_dim);   qat_model_file.read(reinterpret_cast<char*>(w1_int8_unpacked.data()), w1_int8_unpacked.size() * sizeof(int8_t));
+        std::vector<float> b1(qat_hidden_dim);                    qat_model_file.read(reinterpret_cast<char*>(b1.data()), b1.size() * sizeof(float));
+
+        // Read Activation Scales
+        float input_to_fc1_scale;                             qat_model_file.read(reinterpret_cast<char*>(&input_to_fc1_scale), sizeof(float)); // Scale for input to first layer
+        float input_to_fc2_scale;                             qat_model_file.read(reinterpret_cast<char*>(&input_to_fc2_scale), sizeof(float)); // Scale for input to second layer
+
+        // Read Layer 2 (fc2) weights (int8_t from file)
+        std::vector<int8_t> w2_int8_unpacked(qat_hidden_dim * qat_output_dim); qat_model_file.read(reinterpret_cast<char*>(w2_int8_unpacked.data()), w2_int8_unpacked.size() * sizeof(int8_t));
+        std::vector<float> b2(qat_output_dim);                    qat_model_file.read(reinterpret_cast<char*>(b2.data()), b2.size() * sizeof(float));
+
+        std::cout << "QAT Model (mlp_model_aq.bin) loaded successfully." << std::endl;
+        std::cout << "QAT Model Dims: Input " << qat_input_dim << ", Hidden " << qat_hidden_dim << ", Output " << qat_output_dim << std::endl;
+
+
+        // --- 2. Load Full Precision Float MLP --- (NEW)
+        FloatLayer fp_layer1, fp_layer2; // Using fp_ prefix for Full Precision
+        if (!load_full_precision_mlp("mlp_model_float.bin", fp_layer1, fp_layer2, input_dim_padded, hidden_dim, output_dim)) {
+            throw std::runtime_error("Failed to load full precision float model.");
+        }
+        std::cout << "Full Precision Float Model (mlp_model_float.bin) loaded successfully." << std::endl;
+
+
+        // --- 3. Prepare All Models for Inference ---
+        // 3a. LUT Quantized MLP Model
         LutLayer q_layer1, q_layer2;
-        q_layer1.weights = w1_int8; // Directly assign int8 weights
+
+        q_layer1.packed_weights.reserve(hidden_dim * ((input_dim_padded + 4) / 5));
+        for (int i = 0; i < hidden_dim; ++i) {
+            std::vector<int8_t> current_row_unpacked(input_dim_padded, 0);
+            std::copy(w1_int8_unpacked.begin() + i * qat_input_dim,
+                      w1_int8_unpacked.begin() + (i + 1) * qat_input_dim,
+                      current_row_unpacked.begin());
+            std::vector<uint8_t> packed_row = pack_weights_5x3bit(current_row_unpacked, input_dim_padded);
+            q_layer1.packed_weights.insert(q_layer1.packed_weights.end(), packed_row.begin(), packed_row.end());
+        }
         q_layer1.bias = b1;
-        q_layer1.activation_scale = input_to_fc1_scale; // Use the first scale for q_layer1 (input to fc1)
+        q_layer1.activation_scale = input_to_fc1_scale;
 
-        q_layer2.weights = w2_int8; // Directly assign int8 weights
+        q_layer2.packed_weights.reserve(output_dim * ((hidden_dim + 4) / 5));
+        for (int i = 0; i < output_dim; ++i) {
+            std::vector<int8_t> current_row_unpacked(hidden_dim);
+            std::copy(w2_int8_unpacked.begin() + i * hidden_dim,
+                      w2_int8_unpacked.begin() + (i + 1) * hidden_dim,
+                      current_row_unpacked.begin());
+            std::vector<uint8_t> packed_row = pack_weights_5x3bit(current_row_unpacked, hidden_dim);
+            q_layer2.packed_weights.insert(q_layer2.packed_weights.end(), packed_row.begin(), packed_row.end());
+        }
         q_layer2.bias = b2;
-        q_layer2.activation_scale = input_to_fc2_scale; // Use the second scale for q_layer2 (input to fc2)
+        q_layer2.activation_scale = input_to_fc2_scale;
 
-        // For float model, we need float weights by casting from the int8_t version for comparison
-        // This is important for accurate comparison with the QAT float model's behavior.
-        FloatLayer f_layer1, f_layer2;
-        f_layer1.weights.resize(w1_int8.size());
-        for(size_t i = 0; i < w1_int8.size(); ++i) f_layer1.weights[i] = static_cast<float>(w1_int8[i]);
-        f_layer1.bias = b1;
-
-        f_layer2.weights.resize(w2_int8.size());
-        for(size_t i = 0; i < w2_int8.size(); ++i) f_layer2.weights[i] = static_cast<float>(w2_int8[i]);
-        f_layer2.bias = b2;
+        // --- NEW: Global Precomputed LUT ---
+        std::vector<int16_t> precomputed_bit_slice_lut;
+        build_bit_slice_lut_5x3(precomputed_bit_slice_lut); // Build the LUT once at startup
+        std::cout << "Bit-Slice LUT built. Size: " << precomputed_bit_slice_lut.size() * sizeof(int16_t) / 1024.0 << " KB" << std::endl;
 
 
-        // --- 3. Load FashionMNIST Test Data ---
+        // 3b. Weights-Only Quant MLP Model (unpacked ternary weights, int8_t activations)
+        WeightsOnlyQuantLayer wo_q_layer1, wo_q_layer2;
+
+        wo_q_layer1.weights.resize(hidden_dim * input_dim_padded, 0);
+        for(int i = 0; i < hidden_dim; ++i) {
+            std::copy(w1_int8_unpacked.begin() + i * qat_input_dim,
+                      w1_int8_unpacked.begin() + (i + 1) * qat_input_dim,
+                      wo_q_layer1.weights.begin() + i * input_dim_padded);
+        }
+        wo_q_layer1.bias = b1;
+        wo_q_layer1.activation_scale = input_to_fc1_scale;
+
+        wo_q_layer2.weights = w2_int8_unpacked;
+        wo_q_layer2.bias = b2;
+        wo_q_layer2.activation_scale = input_to_fc2_scale;
+
+
+        // (Original) Standard Float MLP - THIS IS NOW THE TRUE FULL PRECISION MLP
+        // The `f_layer1`, `f_layer2` will now hold the weights from `mlp_model_float.bin`
+        // They were already correctly loaded into `fp_layer1`, `fp_layer2` above.
+        // So simply assign them:
+        FloatLayer& f_layer1 = fp_layer1;
+        FloatLayer& f_layer2 = fp_layer2;
+
+
+        // --- 4. Load FashionMNIST Test Data ---
         const int NUM_TEST_IMAGES = 10000; // FashionMNIST test set size
         std::vector<float> test_images_f32;
         std::vector<int> test_labels;
 
         std::cout << "\nLoading FashionMNIST test data..." << std::endl;
-        // Images are originally [0, 255] then normalized by Python to [-1, 1]
-        // Our test_images.bin should reflect this [-1, 1] range.
-        if (!load_images_from_file("test_images.bin", test_images_f32, NUM_TEST_IMAGES, input_dim)) {
+        if (!load_images_from_file("test_images.bin", test_images_f32, NUM_TEST_IMAGES, input_dim_original)) {
             throw std::runtime_error("Could not load test_images.bin. Make sure it's in the same directory.");
         }
         if (!load_labels_from_file("test_labels.bin", test_labels, NUM_TEST_IMAGES)) {
@@ -280,107 +422,138 @@ int main() {
         const int BATCH_SIZE = 64; // Example batch size. Tune this for your CPU.
         int num_batches = (NUM_TEST_IMAGES + BATCH_SIZE - 1) / BATCH_SIZE;
 
-        // --- 4. Performance and Accuracy Evaluation ---
-        int correct_quant = 0;
-        int correct_float = 0;
+        // --- 5. Performance and Accuracy Evaluation ---
+        int correct_quant_lut = 0;
+        int correct_quant_wo = 0;
+        int correct_float_fp = 0; // Renamed for Full Precision Float
 
-        // Accumulate durations for all inferences
-        std::chrono::duration<double, std::milli> total_quant_duration(0.0);
-        std::chrono::duration<double, std::milli> total_float_duration(0.0);
+        std::chrono::duration<double, std::milli> total_quant_lut_duration(0.0);
+        std::chrono::duration<double, std::milli> total_quant_wo_duration(0.0);
+        std::chrono::duration<double, std::milli> total_float_fp_duration(0.0); // Renamed
 
         std::cout << "\nStarting batched inference for " << NUM_TEST_IMAGES << " test images (Batch Size: " << BATCH_SIZE << ")..." << std::endl;
 
         // Vectors for batched inputs and outputs
-        std::vector<float> batch_input_f32(BATCH_SIZE * input_dim);
-        std::vector<int8_t> batch_input_i8(BATCH_SIZE * input_dim);
-        std::vector<float> batch_hidden_q_f32(BATCH_SIZE * hidden_dim);
-        std::vector<int8_t> batch_hidden_i8(BATCH_SIZE * hidden_dim);
-        std::vector<float> batch_final_q(BATCH_SIZE * output_dim);
-        std::vector<float> batch_hidden_f(BATCH_SIZE * hidden_dim);
-        std::vector<float> batch_final_f(BATCH_SIZE * output_dim);
+        std::vector<float> batch_input_f32(BATCH_SIZE * input_dim_padded);
+
+        // Buffers for LUT Quantized MLP path
+        std::vector<int8_t> batch_input_i8_temp_lut(BATCH_SIZE * input_dim_padded);
+        std::vector<int8_t> batch_input_ternary_L1_lut(BATCH_SIZE * input_dim_padded);
+        std::vector<uint8_t> batch_input_packed_activations_L1_lut(BATCH_SIZE * ((input_dim_padded + 4) / 5));
+        std::vector<float> batch_hidden_q_f32_lut(BATCH_SIZE * hidden_dim);
+        std::vector<int8_t> batch_hidden_i8_temp_lut(BATCH_SIZE * hidden_dim);
+        std::vector<uint8_t> batch_hidden_packed_activations_L2_lut(BATCH_SIZE * ((hidden_dim + 4) / 5));
+        std::vector<float> batch_final_q_lut(BATCH_SIZE * output_dim);
+
+        // Buffers for Weights-Only Quant MLP path
+        std::vector<int8_t> batch_input_i8_wo(BATCH_SIZE * input_dim_padded);
+        std::vector<float> batch_hidden_q_f32_wo(BATCH_SIZE * hidden_dim);
+        std::vector<int8_t> batch_hidden_i8_wo(BATCH_SIZE * hidden_dim);
+        std::vector<float> batch_final_q_wo(BATCH_SIZE * output_dim);
+
+        // Buffers for Full Precision Float MLP path (now using the fp_layer data)
+        std::vector<float> batch_hidden_f_fp(BATCH_SIZE * hidden_dim); // Renamed
+        std::vector<float> batch_final_f_fp(BATCH_SIZE * output_dim); // Renamed
+
 
         for (int b_idx = 0; b_idx < num_batches; ++b_idx) {
             int current_batch_actual_size = std::min(BATCH_SIZE, NUM_TEST_IMAGES - b_idx * BATCH_SIZE);
 
             // Copy current batch of images from test_images_f32 into batch_input_f32
-            // Only copy the relevant portion for the current batch
+            // And pad to input_dim_padded. This buffer is shared across all models.
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                std::copy(test_images_f32.begin() + (b_idx * BATCH_SIZE + k) * input_dim,
-                          test_images_f32.begin() + (b_idx * BATCH_SIZE + k + 1) * input_dim,
-                          batch_input_f32.begin() + k * input_dim);
-            }
-            // Note: `batch_input_i8`, `batch_hidden_q_f32`, etc., are pre-sized to max batch size.
-            // Operations on their sub-sections will use pointers.
-
-            // --- Quantized Model Inference for Batch ---
-            auto start_quant = std::chrono::high_resolution_clock::now();
-
-            // Quantize current batch of inputs using the fixed input_to_fc1_scale
-            for (int k = 0; k < current_batch_actual_size; ++k) {
-                quantize_float_to_int8_with_scale(
-                    batch_input_f32.data() + k * input_dim, // Source float data
-                    batch_input_i8.data() + k * input_dim,   // Destination int8 data
-                    input_dim,                              // Size of slice
-                    q_layer1.activation_scale               // Fixed scale for input to fc1
-                );
+                std::copy(test_images_f32.begin() + (b_idx * BATCH_SIZE + k) * input_dim_original,
+                          test_images_f32.begin() + (b_idx * BATCH_SIZE + k + 1) * input_dim_original,
+                          batch_input_f32.begin() + k * input_dim_padded);
+                std::fill(batch_input_f32.begin() + k * input_dim_padded + input_dim_original,
+                          batch_input_f32.begin() + (k + 1) * input_dim_padded,
+                          0.0f);
             }
 
-            lut_linear_forward(q_layer1, batch_input_i8, batch_hidden_q_f32, input_dim, hidden_dim, current_batch_actual_size);
-            // ReLU applied to float output using pointers for in-place modification
+            // --- LUT Quantized Model Inference for Batch ---
+            auto start_quant_lut = std::chrono::high_resolution_clock::now();
+
+            // L1 input: float -> int8_t -> ternary -> pack
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                relu(batch_hidden_q_f32.data() + k * hidden_dim, hidden_dim);
+                quantize_float_to_int8_with_scale(batch_input_f32.data() + k * input_dim_padded, batch_input_i8_temp_lut.data() + k * input_dim_padded, input_dim_padded, q_layer1.activation_scale);
+                for (int l = 0; l < input_dim_padded; ++l) {
+                    batch_input_ternary_L1_lut[k * input_dim_padded + l] = convert_int8_to_ternary_activation(batch_input_i8_temp_lut[k * input_dim_padded + l]);
+                }
             }
-
-
-            // Quantize hidden layer outputs for the next layer using input_to_fc2_scale
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                quantize_float_to_int8_with_scale(
-                    batch_hidden_q_f32.data() + k * hidden_dim, // Source float data (after ReLU)
-                    batch_hidden_i8.data() + k * hidden_dim,    // Destination int8 data
-                    hidden_dim,                               // Size of slice
-                    q_layer2.activation_scale                 // Fixed scale for input to fc2
-                );
+                std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(std::vector<int8_t>(batch_input_ternary_L1_lut.begin() + k * input_dim_padded, batch_input_ternary_L1_lut.begin() + (k + 1) * input_dim_padded), input_dim_padded);
+                std::copy(packed_act_sample.begin(), packed_act_sample.end(), batch_input_packed_activations_L1_lut.begin() + k * ((input_dim_padded + 4) / 5));
             }
+            lut_linear_forward(q_layer1, batch_input_packed_activations_L1_lut, batch_hidden_q_f32_lut, input_dim_padded, hidden_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
 
-            lut_linear_forward(q_layer2, batch_hidden_i8, batch_final_q, hidden_dim, output_dim, current_batch_actual_size);
-            // LogSoftmax applied to float output using pointers for in-place modification
+            // L2 input: float -> int8_t (no second ternary conversion needed) -> pack
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                log_softmax(batch_final_q.data() + k * output_dim, output_dim);
+                quantize_float_to_int8_with_scale(batch_hidden_q_f32_lut.data() + k * hidden_dim, batch_hidden_i8_temp_lut.data() + k * hidden_dim, hidden_dim, q_layer2.activation_scale);
             }
+            for (int k = 0; k < current_batch_actual_size; ++k) {
+                 std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(std::vector<int8_t>(batch_hidden_i8_temp_lut.begin() + k * hidden_dim, batch_hidden_i8_temp_lut.begin() + (k + 1) * hidden_dim), hidden_dim);
+                std::copy(packed_act_sample.begin(), packed_act_sample.end(), batch_hidden_packed_activations_L2_lut.begin() + k * ((hidden_dim + 4) / 5));
+            }
+            lut_linear_forward(q_layer2, batch_hidden_packed_activations_L2_lut, batch_final_q_lut, hidden_dim, output_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
+            log_softmax(batch_final_q_lut.data() + 0, output_dim * current_batch_actual_size); // Apply log_softmax to entire batch output
 
-            auto end_quant = std::chrono::high_resolution_clock::now();
-            total_quant_duration += (end_quant - start_quant);
+            auto end_quant_lut = std::chrono::high_resolution_clock::now();
+            total_quant_lut_duration += (end_quant_lut - start_quant_lut);
 
-            // Calculate accuracy for the quantized batch
             for (int k = 0; k < current_batch_actual_size; ++k) {
                 int true_label = test_labels[b_idx * BATCH_SIZE + k];
-                if (argmax(batch_final_q, k * output_dim, output_dim) == true_label) {
-                    correct_quant++;
+                if (argmax(batch_final_q_lut, k * output_dim, output_dim) == true_label) {
+                    correct_quant_lut++;
                 }
             }
 
-            // --- Standard Float Model Inference for Batch ---
-            auto start_float = std::chrono::high_resolution_clock::now();
-            standard_linear_forward(f_layer1, batch_input_f32, batch_hidden_f, input_dim, hidden_dim, current_batch_actual_size);
-            // ReLU applied to float output using pointers for in-place modification
+
+            // --- Weights-Only Quantized Model Inference for Batch ---
+            auto start_quant_wo = std::chrono::high_resolution_clock::now();
+
+            // L1 input: float -> int8_t (no ternary or packing for WO)
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                relu(batch_hidden_f.data() + k * hidden_dim, hidden_dim);
+                quantize_float_to_int8_with_scale(batch_input_f32.data() + k * input_dim_padded, batch_input_i8_wo.data() + k * input_dim_padded, input_dim_padded, wo_q_layer1.activation_scale);
+            }
+            weights_only_linear_forward(wo_q_layer1, batch_input_i8_wo, batch_hidden_q_f32_wo, input_dim_padded, hidden_dim, current_batch_actual_size);
+
+            // ReLU on float output
+            for (int k = 0; k < current_batch_actual_size; ++k) {
+                relu(batch_hidden_q_f32_wo.data() + k * hidden_dim, hidden_dim);
             }
 
-            standard_linear_forward(f_layer2, batch_hidden_f, batch_final_f, hidden_dim, output_dim, current_batch_actual_size);
-            // LogSoftmax applied to float output using pointers for in-place modification
+            // L2 input: float -> int8_t (no ternary or packing for WO)
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                log_softmax(batch_final_f.data() + k * output_dim, output_dim);
+                quantize_float_to_int8_with_scale(batch_hidden_q_f32_wo.data() + k * hidden_dim, batch_hidden_i8_wo.data() + k * hidden_dim, hidden_dim, wo_q_layer2.activation_scale);
             }
+            weights_only_linear_forward(wo_q_layer2, batch_hidden_i8_wo, batch_final_q_wo, hidden_dim, output_dim, current_batch_actual_size);
+            log_softmax(batch_final_q_wo.data() + 0, output_dim * current_batch_actual_size);
 
-            auto end_float = std::chrono::high_resolution_clock::now();
-            total_float_duration += (end_float - start_float);
+            auto end_quant_wo = std::chrono::high_resolution_clock::now();
+            total_quant_wo_duration += (end_quant_wo - start_quant_wo);
 
-            // Calculate accuracy for the float batch
             for (int k = 0; k < current_batch_actual_size; ++k) {
                 int true_label = test_labels[b_idx * BATCH_SIZE + k];
-                if (argmax(batch_final_f, k * output_dim, output_dim) == true_label) {
-                    correct_float++;
+                if (argmax(batch_final_q_wo, k * output_dim, output_dim) == true_label) {
+                    correct_quant_wo++;
+                }
+            }
+
+
+            // --- Full Precision Float MLP Inference for Batch ---
+            auto start_float_fp = std::chrono::high_resolution_clock::now();
+            standard_linear_forward(f_layer1, batch_input_f32, batch_hidden_f_fp, input_dim_padded, hidden_dim, current_batch_actual_size);
+            relu(batch_hidden_f_fp.data() + 0, hidden_dim * current_batch_actual_size);
+            standard_linear_forward(f_layer2, batch_hidden_f_fp, batch_final_f_fp, hidden_dim, output_dim, current_batch_actual_size);
+            log_softmax(batch_final_f_fp.data() + 0, output_dim * current_batch_actual_size);
+
+            auto end_float_fp = std::chrono::high_resolution_clock::now();
+            total_float_fp_duration += (end_float_fp - start_float_fp);
+
+            for (int k = 0; k < current_batch_actual_size; ++k) {
+                int true_label = test_labels[b_idx * BATCH_SIZE + k];
+                if (argmax(batch_final_f_fp, k * output_dim, output_dim) == true_label) {
+                    correct_float_fp++;
                 }
             }
 
@@ -389,26 +562,36 @@ int main() {
             }
         }
 
-        double quant_accuracy = static_cast<double>(correct_quant) / NUM_TEST_IMAGES * 100.0;
-        double float_accuracy = static_cast<double>(correct_float) / NUM_TEST_IMAGES * 100.0;
+        double quant_lut_accuracy = static_cast<double>(correct_quant_lut) / NUM_TEST_IMAGES * 100.0;
+        double quant_wo_accuracy = static_cast<double>(correct_quant_wo) / NUM_TEST_IMAGES * 100.0;
+        double float_fp_accuracy = static_cast<double>(correct_float_fp) / NUM_TEST_IMAGES * 100.0;
 
-        // --- 5. Calculate Memory and Print Comparison Table ---
-        size_t quant_mem = (q_layer1.weights.size() + q_layer2.weights.size()) * sizeof(int8_t);
-        size_t float_mem = (f_layer1.weights.size() + f_layer2.weights.size()) * sizeof(float);
+        // --- 6. Calculate Memory and Print Comparison Table ---
+        size_t quant_lut_weights_mem = (q_layer1.packed_weights.size() + q_layer2.packed_weights.size()) * sizeof(uint8_t);
+        size_t quant_lut_total_mem = quant_lut_weights_mem + precomputed_bit_slice_lut.size() * sizeof(int16_t);
+
+        size_t quant_wo_mem = (wo_q_layer1.weights.size() + wo_q_layer2.weights.size()) * sizeof(int8_t);
+
+        size_t float_fp_mem = (fp_layer1.weights.size() + fp_layer2.weights.size()) * sizeof(float);
 
         std::cout << "\n\n--- Performance and Accuracy Comparison (" << NUM_TEST_IMAGES << " images, Batch Size: " << BATCH_SIZE << ") ---" << std::endl;
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "Metric              | LUT Quantized MLP  | Standard Float MLP " << std::endl;
-        std::cout << "--------------------|--------------------|--------------------" << std::endl;
-        std::cout << "Total Time (ms)     | " << std::setw(18) << total_quant_duration.count() << " | " << std::setw(18) << total_float_duration.count() << std::endl;
-        std::cout << "Avg. Time / iter(ms)| " << std::setw(18) << total_quant_duration.count() / NUM_TEST_IMAGES << " | " << std::setw(18) << total_float_duration.count() / NUM_TEST_IMAGES << std::endl;
-        std::cout << "Accuracy (%)        | " << std::setw(18) << quant_accuracy << " | " << std::setw(18) << float_accuracy << std::endl;
-        std::cout << "Weight Memory (kB)  | " << std::setw(18) << quant_mem / 1024.0 << " | " << std::setw(18) << float_mem / 1024.0 << std::endl;
+        std::cout << "Metric              | LUT Quantized MLP  | Wt-Only Quant MLP  | Full Prec. Float MLP " << std::endl;
+        std::cout << "--------------------|--------------------|--------------------|----------------------" << std::endl;
+        std::cout << "Total Time (ms)     | " << std::setw(18) << total_quant_lut_duration.count() << " | " << std::setw(18) << total_quant_wo_duration.count() << " | " << std::setw(20) << total_float_fp_duration.count() << std::endl;
+        std::cout << "Avg. Time / iter(ms)| " << std::setw(18) << total_quant_lut_duration.count() / NUM_TEST_IMAGES << " | " << std::setw(18) << total_quant_wo_duration.count() / NUM_TEST_IMAGES << " | " << std::setw(20) << total_float_fp_duration.count() / NUM_TEST_IMAGES << std::endl;
+        std::cout << "Accuracy (%)        | " << std::setw(18) << quant_lut_accuracy << " | " << std::setw(18) << quant_wo_accuracy << " | " << std::setw(20) << float_fp_accuracy << std::endl;
+        std::cout << "Weight Memory (kB)  | " << std::setw(18) << quant_lut_total_mem / 1024.0 << " | " << std::setw(18) << quant_wo_mem / 1024.0 << " | " << std::setw(20) << float_fp_mem / 1024.0 << std::endl;
         std::cout << "-------------------------------------------------------------" << std::endl;
-        if (total_quant_duration.count() > 0.0001) {
-            std::cout << "Speedup vs Float: " << total_float_duration.count() / total_quant_duration.count() << "x" << std::endl;
+        if (total_quant_lut_duration.count() > 0.0001) {
+            std::cout << "Speedup LUT vs Full Prec. Float: " << total_float_fp_duration.count() / total_quant_lut_duration.count() << "x" << std::endl;
         }
-        std::cout << "Memory Reduction: " << (1.0 - (double)quant_mem / float_mem) * 100.0 << "%" << std::endl;
+        if (total_quant_wo_duration.count() > 0.0001) {
+            std::cout << "Speedup Wt-Only vs Full Prec. Float: " << total_float_fp_duration.count() / total_quant_wo_duration.count() << "x" << std::endl;
+        }
+        std::cout << "Memory Reduction LUT vs Full Prec. Float: " << (1.0 - (double)quant_lut_total_mem / float_fp_mem) * 100.0 << "%" << std::endl;
+        std::cout << "Memory Reduction Wt-Only vs Full Prec. Float: " << (1.0 - (double)quant_wo_mem / float_fp_mem) * 100.0 << "%" << std::endl;
+
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

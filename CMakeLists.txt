@@ -45,20 +45,17 @@ add_library(bitnet_kernels STATIC
 )
 
 # --- 构建最终的主程序 ---
-add_executable(myQATModel main.cpp)
+add_executable(myQATModel main.cpp model_preproc.cpp bit_slice_kernels.cpp)
 
 # --- 链接库 ---
 # 将我们的主程序链接到所有必需的库上
 target_link_libraries(myQATModel PRIVATE
-        llama           # llama.cpp 提供的核心库
-        bitnet_kernels  # 我们自己编译的内核库
         Threads::Threads  # 线程库
 )
 
 # 解决MSVC编译器关于'getenv'等函数的警告
 if(MSVC)
     target_compile_definitions(myQATModel PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_definitions(bitnet_kernels PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 message(STATUS "Project configured successfully. This is the final version.")
