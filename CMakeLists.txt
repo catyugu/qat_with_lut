@@ -15,6 +15,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # 启用针对x86 CPU的高性能内核
 add_compile_definitions(GGML_BITNET_X86_TL2)
 add_compile_definitions(GGML_BITNET_X86_AVX2)
+#add_compile_definitions(GGML_BITNET_X86_AVX512)
 
 # --- 构建最终的主程序 ---
 add_executable(myQATModel
@@ -34,6 +35,7 @@ target_link_libraries(myQATModel PRIVATE
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(myQATModel PRIVATE -mavx2)
 elseif(MSVC)
+#    target_compile_options(myQATModel PRIVATE /arch:AVX512)
     target_compile_options(myQATModel PRIVATE /arch:AVX2)
 endif()
 
