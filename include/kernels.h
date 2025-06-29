@@ -3,7 +3,7 @@
 
 #include <vector>
 #include <cstdint> // For uint8_t, int16_t, int32_t
-
+#include <omp.h>   // Add this line
 // Forward declarations for structs defined in types.h
 struct LutLayer;
 struct WeightsOnlyQuantLayer;

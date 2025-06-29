@@ -145,7 +145,7 @@ void lut_linear_forward(
     output_f32_batched.resize(batch_size * output_dim);
     const uint8_t* weights_packed_ptr = layer.packed_weights.data();
     const int packed_input_bytes_per_sample = (input_dim + 4) / 5;
-
+    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const uint8_t* current_batch_input_packed_ptr = input_packed_batched.data() + b * packed_input_bytes_per_sample;
         for (int i = 0; i < output_dim; ++i) { // Fixed loop condition
@@ -182,7 +182,7 @@ void weights_only_linear_forward(
 ) {
     output_f32_batched.resize(batch_size * output_dim);
     const int8_t* weights_ptr = layer.weights.data();
-
+    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const int8_t* current_batch_input_ptr = input_i8_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
@@ -244,6 +244,7 @@ void standard_linear_forward(
     int batch_size
 ) {
     output_f32_batched.resize(batch_size * output_dim);
+    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const float* current_batch_input_ptr = input_f32_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {

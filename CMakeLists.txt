@@ -4,7 +4,7 @@ project(myQATModel CXX C)
 
 # --- 查找并设置必需的包 ---
 find_package(Threads REQUIRED)
-
+find_package(OpenMP REQUIRED) # Add this line
 # --- 设置C++标准 ---
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ target_include_directories(myQATModel PUBLIC include)
 # 将我们的主程序链接到所有必需的库上
 target_link_libraries(myQATModel PRIVATE
         Threads::Threads  # 线程库
+        OpenMP::OpenMP_CXX # Add this line
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
