@@ -59,7 +59,6 @@ static inline int hsum_i32_8(const __m256i a) {
     // Unpack high 64 bits to lower 64 bits and add to original
     const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
     const __m128i sum64 = _mm_add_epi32(hi64, sum128);
-    // Shuffle sum64 to get (v3, v2, v1, v0) where v0 is at lowest 32 bits
     const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
     // Add sum64 and hi32, then extract the lowest 32-bit integer (which now contains the total sum)
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
@@ -419,7 +418,7 @@ int main() {
         std::cout << "Successfully loaded " << NUM_TEST_IMAGES << " test images and labels." << std::endl;
 
         // --- Batching Configuration ---
-        const int BATCH_SIZE = 64; // Example batch size. Tune this for your CPU.
+        const int BATCH_SIZE = 64; // Example batch size.
         int num_batches = (NUM_TEST_IMAGES + BATCH_SIZE - 1) / BATCH_SIZE;
 
         // --- 5. Performance and Accuracy Evaluation ---
@@ -433,7 +432,7 @@ int main() {
 
         std::cout << "\nStarting batched inference for " << NUM_TEST_IMAGES << " test images (Batch Size: " << BATCH_SIZE << ")..." << std::endl;
 
-        // Vectors for batched inputs and outputs
+        // Vectors for batched inputs and outputs (declared once with max capacity)
         std::vector<float> batch_input_f32(BATCH_SIZE * input_dim_padded);
 
         // Buffers for LUT Quantized MLP path
@@ -451,9 +450,9 @@ int main() {
         std::vector<int8_t> batch_hidden_i8_wo(BATCH_SIZE * hidden_dim);
         std::vector<float> batch_final_q_wo(BATCH_SIZE * output_dim);
 
-        // Buffers for Full Precision Float MLP path (now using the fp_layer data)
-        std::vector<float> batch_hidden_f_fp(BATCH_SIZE * hidden_dim); // Renamed
-        std::vector<float> batch_final_f_fp(BATCH_SIZE * output_dim); // Renamed
+        // Buffers for Full Precision Float MLP path
+        std::vector<float> batch_hidden_f_fp(BATCH_SIZE * hidden_dim);
+        std::vector<float> batch_final_f_fp(BATCH_SIZE * output_dim);
 
 
         for (int b_idx = 0; b_idx < num_batches; ++b_idx) {
@@ -567,30 +566,66 @@ int main() {
         double float_fp_accuracy = static_cast<double>(correct_float_fp) / NUM_TEST_IMAGES * 100.0;
 
         // --- 6. Calculate Memory and Print Comparison Table ---
-        size_t quant_lut_weights_mem = (q_layer1.packed_weights.size() + q_layer2.packed_weights.size()) * sizeof(uint8_t);
-        size_t quant_lut_total_mem = quant_lut_weights_mem + precomputed_bit_slice_lut.size() * sizeof(int16_t);
+        // Model Parameter Memory (Weights + Bias + LUT for LUT model)
+        size_t quant_lut_model_mem = (q_layer1.packed_weights.size() + q_layer2.packed_weights.size()) * sizeof(uint8_t) + precomputed_bit_slice_lut.size() * sizeof(int16_t) + (b1.size() + b2.size()) * sizeof(float);
+        size_t quant_wo_model_mem = (wo_q_layer1.weights.size() + wo_q_layer2.weights.size()) * sizeof(int8_t) + (b1.size() + b2.size()) * sizeof(float);
+        size_t float_fp_model_mem = (fp_layer1.weights.size() + fp_layer2.weights.size()) * sizeof(float) + (fp_layer1.bias.size() + fp_layer2.bias.size()) * sizeof(float);
 
-        size_t quant_wo_mem = (wo_q_layer1.weights.size() + wo_q_layer2.weights.size()) * sizeof(int8_t);
+        // Runtime Buffer Memory (Activations + Temps for 1 Batch)
+        // Calculated based on maximum capacities of declared vectors.
+        // This represents the memory allocated for these buffers once.
+        size_t runtime_buffers_mem_lut =
+            batch_input_f32.capacity() * sizeof(float) + // Shared input buffer
+            batch_input_i8_temp_lut.capacity() * sizeof(int8_t) +
+            batch_input_ternary_L1_lut.capacity() * sizeof(int8_t) +
+            batch_input_packed_activations_L1_lut.capacity() * sizeof(uint8_t) +
+            batch_hidden_q_f32_lut.capacity() * sizeof(float) +
+            batch_hidden_i8_temp_lut.capacity() * sizeof(int8_t) +
+            batch_hidden_packed_activations_L2_lut.capacity() * sizeof(uint8_t) +
+            batch_final_q_lut.capacity() * sizeof(float);
 
-        size_t float_fp_mem = (fp_layer1.weights.size() + fp_layer2.weights.size()) * sizeof(float);
+        size_t runtime_buffers_mem_wo =
+            batch_input_f32.capacity() * sizeof(float) + // Shared input buffer
+            batch_input_i8_wo.capacity() * sizeof(int8_t) +
+            batch_hidden_q_f32_wo.capacity() * sizeof(float) +
+            batch_hidden_i8_wo.capacity() * sizeof(int8_t) +
+            batch_final_q_wo.capacity() * sizeof(float);
+
+        size_t runtime_buffers_mem_fp =
+            batch_input_f32.capacity() * sizeof(float) + // Shared input buffer
+            batch_hidden_f_fp.capacity() * sizeof(float) +
+            batch_final_f_fp.capacity() * sizeof(float);
+
+        // Total Memory (Model Parameters + Runtime Buffers)
+        // This sum gives the total allocated memory for each model's full inference path,
+        // including its parameters and the temporary buffers it needs for a batch.
+        size_t total_mem_lut = quant_lut_model_mem + runtime_buffers_mem_lut;
+        size_t total_mem_wo = quant_wo_model_mem + runtime_buffers_mem_wo;
+        size_t total_mem_fp = float_fp_model_mem + runtime_buffers_mem_fp;
+
 
         std::cout << "\n\n--- Performance and Accuracy Comparison (" << NUM_TEST_IMAGES << " images, Batch Size: " << BATCH_SIZE << ") ---" << std::endl;
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "Metric              | LUT Quantized MLP  | Wt-Only Quant MLP  | Full Prec. Float MLP " << std::endl;
+        std::cout << "Metric              | All Quantized MLP (LUT) | Wt-Only Quant MLP  | Full Prec. Float MLP " << std::endl;
         std::cout << "--------------------|--------------------|--------------------|----------------------" << std::endl;
         std::cout << "Total Time (ms)     | " << std::setw(18) << total_quant_lut_duration.count() << " | " << std::setw(18) << total_quant_wo_duration.count() << " | " << std::setw(20) << total_float_fp_duration.count() << std::endl;
         std::cout << "Avg. Time / iter(ms)| " << std::setw(18) << total_quant_lut_duration.count() / NUM_TEST_IMAGES << " | " << std::setw(18) << total_quant_wo_duration.count() / NUM_TEST_IMAGES << " | " << std::setw(20) << total_float_fp_duration.count() / NUM_TEST_IMAGES << std::endl;
         std::cout << "Accuracy (%)        | " << std::setw(18) << quant_lut_accuracy << " | " << std::setw(18) << quant_wo_accuracy << " | " << std::setw(20) << float_fp_accuracy << std::endl;
-        std::cout << "Weight Memory (kB)  | " << std::setw(18) << quant_lut_total_mem / 1024.0 << " | " << std::setw(18) << quant_wo_mem / 1024.0 << " | " << std::setw(20) << float_fp_mem / 1024.0 << std::endl;
+        // Updated memory rows
+        std::cout << "Weight Memory (kB)  | " << std::setw(18) << quant_lut_model_mem / 1024.0 << " | " << std::setw(18) << quant_wo_model_mem / 1024.0 << " | " << std::setw(20) << float_fp_model_mem / 1024.0 << std::endl;
+        std::cout << "Runtime Buffers (kB)| " << std::setw(18) << runtime_buffers_mem_lut / 1024.0 << " | " << std::setw(18) << runtime_buffers_mem_wo / 1024.0 << " | " << std::setw(20) << runtime_buffers_mem_fp / 1024.0 << std::endl;
+        std::cout << "Total Memory (kB)   | " << std::setw(18) << total_mem_lut / 1024.0 << " | " << std::setw(18) << total_mem_wo / 1024.0 << " | " << std::setw(20) << total_mem_fp / 1024.0 << std::endl;
         std::cout << "-------------------------------------------------------------" << std::endl;
         if (total_quant_lut_duration.count() > 0.0001) {
-            std::cout << "Speedup LUT vs Full Prec. Float: " << total_float_fp_duration.count() / total_quant_lut_duration.count() << "x" << std::endl;
+            std::cout << "Speedup All vs Full Prec. Float: " << total_float_fp_duration.count() / total_quant_lut_duration.count() << "x" << std::endl;
         }
         if (total_quant_wo_duration.count() > 0.0001) {
             std::cout << "Speedup Wt-Only vs Full Prec. Float: " << total_float_fp_duration.count() / total_quant_wo_duration.count() << "x" << std::endl;
         }
-        std::cout << "Memory Reduction LUT vs Full Prec. Float: " << (1.0 - (double)quant_lut_total_mem / float_fp_mem) * 100.0 << "%" << std::endl;
-        std::cout << "Memory Reduction Wt-Only vs Full Prec. Float: " << (1.0 - (double)quant_wo_mem / float_fp_mem) * 100.0 << "%" << std::endl;
+        std::cout << "Memory Reduction All vs Full Prec. Float (Model Params): " << (1.0 - (double)quant_lut_model_mem / float_fp_model_mem) * 100.0 << "%" << std::endl;
+        std::cout << "Memory Reduction Wt-Only vs Full Prec. Float (Model Params): " << (1.0 - (double)quant_wo_model_mem / float_fp_model_mem) * 100.0 << "%" << std::endl;
+        std::cout << "Total Memory Reduction All vs Full Prec. Float: " << (1.0 - (double)total_mem_lut / total_mem_fp) * 100.0 << "%" << std::endl;
+        std::cout << "Total Memory Reduction Wt-Only vs Full Prec. Float: " << (1.0 - (double)total_mem_wo / total_mem_fp) * 100.0 << "%" << std::endl;
 
 
     } catch (const std::exception& e) {

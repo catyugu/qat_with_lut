@@ -1,3 +1,5 @@
 cmake-build-debug/
 datasets/
 .idea/
+*.pth
+*.bin
