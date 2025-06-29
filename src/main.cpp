@@ -143,7 +143,7 @@ int main() {
 
         std::cout << "\nLoading FashionMNIST test data..." << std::endl;
         // Modified: Load pre-padded float images
-        if (!load_images_from_file("test_images_padded.bin", test_images_f32, NUM_TEST_IMAGES, input_dim_padded)) {
+        if (!load_images_from_file("test_images_padded_f32.bin", test_images_f32, NUM_TEST_IMAGES, input_dim_padded)) {
             throw std::runtime_error("Could not load test_images_padded_f32.bin. Please run save_all_images.py first.");
         }
         if (!load_labels_from_file("test_labels.bin", test_labels, NUM_TEST_IMAGES)) {
@@ -166,13 +166,12 @@ int main() {
                 input_dim_padded,
                 q_layer1.activation_scale
             );
-            std::vector<uint8_t> packed_act_sample_lut = pack_ternary_activations_5x3bit(
-                std::vector<int8_t>(preprocessed_input_i8_lut.begin() + k * input_dim_padded,
-                                     preprocessed_input_i8_lut.begin() + (k + 1) * input_dim_padded),
-                input_dim_padded
+            // Use the new pack_ternary_activations_5x3bit_to_ptr to directly write to the pre-allocated buffer
+            pack_ternary_activations_5x3bit_to_ptr(
+                preprocessed_input_i8_lut.data() + k * input_dim_padded,
+                input_dim_padded,
+                preprocessed_input_packed_lut.data() + k * ((input_dim_padded + 4) / 5)
             );
-            std::copy(packed_act_sample_lut.begin(), packed_act_sample_lut.end(),
-                      preprocessed_input_packed_lut.begin() + k * ((input_dim_padded + 4) / 5));
 
             // For Weights-Only Quant MLP
             quantize_float_to_int8_with_scale(
@@ -261,13 +260,12 @@ int main() {
                     hidden_dim,
                     q_layer2.activation_scale
                 );
-                std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(
-                    std::vector<int8_t>(batch_hidden_i8_temp_lut.begin() + k * hidden_dim,
-                                         batch_hidden_i8_temp_lut.begin() + (k + 1) * hidden_dim),
-                    hidden_dim
+                // NEW: Use the modified packing function that writes to a pointer
+                pack_ternary_activations_5x3bit_to_ptr(
+                    batch_hidden_i8_temp_lut.data() + k * hidden_dim,
+                    hidden_dim,
+                    batch_hidden_packed_activations_L2_lut.data() + k * ((hidden_dim + 4) / 5)
                  );
-                std::copy(packed_act_sample.begin(), packed_act_sample.end(),
-                          batch_hidden_packed_activations_L2_lut.begin() + k * ((hidden_dim + 4) / 5));
             }
             lut_linear_forward(q_layer2, batch_hidden_packed_activations_L2_lut, batch_final_q_lut, hidden_dim, output_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
             log_softmax(batch_final_q_lut.data() + 0, output_dim * current_batch_actual_size); // Apply log_softmax to entire batch output

@@ -51,11 +51,17 @@ int32_t avx512_bit_slice_gemm_kernel(
         _mm512_storeu_si512(reinterpret_cast<__m512i*>(temp_packed_acts_raw), packed_acts_bytes);
         _mm512_storeu_si512(reinterpret_cast<__m512i*>(temp_packed_weights_raw), packed_weights_bytes);
 
-        #pragma unroll
-        for (int i = 0; i < 64; ++i) {
-            uint8_t packed_act_byte = temp_packed_acts_raw[i];
-            uint8_t packed_weight_byte = temp_packed_weights_raw[i];
-            block_sum_of_products[i] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte) << 8) | packed_weight_byte];
+        // Manually unroll the loop by a factor of 8 (64 / 8 = 8 iterations)
+        // Original loop was for (int i = 0; i < 64; ++i)
+        for (int i = 0; i < 64; i += 8) {
+            block_sum_of_products[i + 0] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 0]) << 8) | temp_packed_weights_raw[i + 0]];
+            block_sum_of_products[i + 1] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 1]) << 8) | temp_packed_weights_raw[i + 1]];
+            block_sum_of_products[i + 2] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 2]) << 8) | temp_packed_weights_raw[i + 2]];
+            block_sum_of_products[i + 3] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 3]) << 8) | temp_packed_weights_raw[i + 3]];
+            block_sum_of_products[i + 4] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 4]) << 8) | temp_packed_weights_raw[i + 4]];
+            block_sum_of_products[i + 5] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 5]) << 8) | temp_packed_weights_raw[i + 5]];
+            block_sum_of_products[i + 6] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 6]) << 8) | temp_packed_weights_raw[i + 6]];
+            block_sum_of_products[i + 7] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 7]) << 8) | temp_packed_weights_raw[i + 7]];
         }
 
         // Accumulate the 64 int16_t results using AVX512 intrinsics
@@ -105,11 +111,24 @@ int32_t avx2_bit_slice_gemm_kernel(
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_acts_raw), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + byte_idx_block)));
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_weights_raw), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + byte_idx_block)));
 
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            uint8_t packed_act_byte = temp_packed_acts_raw[i];
-            uint8_t packed_weight_byte = temp_packed_weights_raw[i];
-            block_sum_of_products[i] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte) << 8) | packed_weight_byte];
+        // Manually unroll the loop by a factor of 4 (32 / 4 = 8 iterations)
+        // Original loop was for (int i = 0; i < 32; ++i)
+        for (int i = 0; i < 32; i += 4) {
+            uint8_t packed_act_byte_0 = temp_packed_acts_raw[i + 0];
+            uint8_t packed_weight_byte_0 = temp_packed_weights_raw[i + 0];
+            block_sum_of_products[i + 0] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_0) << 8) | packed_weight_byte_0];
+
+            uint8_t packed_act_byte_1 = temp_packed_acts_raw[i + 1];
+            uint8_t packed_weight_byte_1 = temp_packed_weights_raw[i + 1];
+            block_sum_of_products[i + 1] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_1) << 8) | packed_weight_byte_1];
+
+            uint8_t packed_act_byte_2 = temp_packed_acts_raw[i + 2];
+            uint8_t packed_weight_byte_2 = temp_packed_weights_raw[i + 2];
+            block_sum_of_products[i + 2] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_2) << 8) | packed_weight_byte_2];
+
+            uint8_t packed_act_byte_3 = temp_packed_acts_raw[i + 3];
+            uint8_t packed_weight_byte_3 = temp_packed_weights_raw[i + 3];
+            block_sum_of_products[i + 3] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_3) << 8) | packed_weight_byte_3];
         }
 
         __m256i sum_of_products_vec0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_sum_of_products));
@@ -145,7 +164,6 @@ void lut_linear_forward(
     output_f32_batched.resize(batch_size * output_dim);
     const uint8_t* weights_packed_ptr = layer.packed_weights.data();
     const int packed_input_bytes_per_sample = (input_dim + 4) / 5;
-    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const uint8_t* current_batch_input_packed_ptr = input_packed_batched.data() + b * packed_input_bytes_per_sample;
         for (int i = 0; i < output_dim; ++i) { // Fixed loop condition
@@ -182,7 +200,6 @@ void weights_only_linear_forward(
 ) {
     output_f32_batched.resize(batch_size * output_dim);
     const int8_t* weights_ptr = layer.weights.data();
-    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const int8_t* current_batch_input_ptr = input_i8_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
@@ -244,7 +261,6 @@ void standard_linear_forward(
     int batch_size
 ) {
     output_f32_batched.resize(batch_size * output_dim);
-    #pragma omp parallel for collapse(2) // Add this pragma
     for (int b = 0; b < batch_size; ++b) {
         const float* current_batch_input_ptr = input_f32_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {

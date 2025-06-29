@@ -27,9 +27,12 @@ void quantize_float_to_int8_with_scale(const float* float_ptr, int8_t* int_ptr, 
 void build_bit_slice_lut_5x3(std::vector<int16_t>& precomputed_lut);
 
 // Packs unpacked int8_t weights (which are effectively ternary {-1,0,1}) into 5x3-bit packed uint8_t format.
+// This version returns a new vector and is mainly for initial model packing.
 std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_weights, int original_size);
-// Packs unpacked int8_t activations (which are quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
-std::vector<uint8_t> pack_ternary_activations_5x3bit(const std::vector<int8_t>& unpacked_activations, int original_size);
+
+// NEW: Packs unpacked int8_t activations (which are quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
+// This version writes directly to a provided output pointer, avoiding dynamic allocations per call.
+void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_ptr, int original_size, uint8_t* output_packed_ptr);
 
 
 // C++ 端用于将 int8_t 值转换为三值 (-1, 0, 1) 的阈值。

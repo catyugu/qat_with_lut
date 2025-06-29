@@ -34,7 +34,7 @@ target_link_libraries(myQATModel PRIVATE
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(myQATModel PRIVATE -mavx2)
+    target_compile_options(myQATModel PRIVATE -mavx2 -O3)
 elseif(MSVC)
 #    target_compile_options(myQATModel PRIVATE /arch:AVX512)
     target_compile_options(myQATModel PRIVATE /arch:AVX2)

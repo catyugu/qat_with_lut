@@ -280,24 +280,22 @@ std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_wei
     return packed_weights_vec;
 }
 
-// Packs unpacked int8_t activations (quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
-// Now uses SIMD to ternarize and encode int8_t to encoded uint8_t before packing.
-std::vector<uint8_t> pack_ternary_activations_5x3bit(const std::vector<int8_t>& unpacked_activations, int original_size) {
-    std::vector<uint8_t> packed_activations_vec;
-    packed_activations_vec.reserve((original_size + 4) / 5); // Reserve enough space
-
+// NEW: Packs unpacked int8_t activations (quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
+// This version writes directly to a provided output pointer, avoiding dynamic allocations per call.
+void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_ptr, int original_size, uint8_t* output_packed_ptr) {
     std::vector<uint8_t> encoded_unpacked_activations(original_size);
     // Use SIMD to ternarize int8_t activations and then encode them to 3-bit encoded uint8_t (0, 1, 2)
-    ternarize_int8_to_3bit_simd(unpacked_activations.data(), encoded_unpacked_activations.data(), original_size);
+    ternarize_int8_to_3bit_simd(unpacked_activations_ptr, encoded_unpacked_activations.data(), original_size);
 
     uint8_t five_ternary_encoded_vals[5]; // Buffer for 5 encoded values
+    int packed_idx = 0; // Index for output_packed_ptr
 
     for (int i = 0; i < original_size; ++i) {
         int pack_idx_in_five = i % 5;
         five_ternary_encoded_vals[pack_idx_in_five] = encoded_unpacked_activations[i];
 
         if (pack_idx_in_five == 4) { // When 5 values are collected
-            packed_activations_vec.push_back(pack_five_ternary(five_ternary_encoded_vals));
+            output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
             // Reset buffer for next 5 values
             for(int k=0; k<5; ++k) five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
         }
@@ -308,10 +306,10 @@ std::vector<uint8_t> pack_ternary_activations_5x3bit(const std::vector<int8_t>& 
         for(int k = original_size % 5; k < 5; ++k) {
             five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
         }
-        packed_activations_vec.push_back(pack_five_ternary(five_ternary_encoded_vals));
+        output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
     }
-    return packed_activations_vec;
 }
+
 
 // --- 激活函数实现 ---
 void relu(float* vec_ptr, size_t size) {
