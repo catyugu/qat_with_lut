@@ -11,24 +11,46 @@ struct LutLayer;
 struct WeightsOnlyQuantLayer;
 
 // --- 5x3 bit 编码/解码函数 ---
+// These functions encode/decode a single ternary value to/from its 3-bit representation (0, 1, 2).
 uint8_t encode_ternary_to_3bit_val(int8_t val);
 int8_t decode_3bit_val_to_ternary(uint8_t encoded_val);
-uint8_t pack_five_ternary(const int8_t t_values[5]);
-void unpack_five_ternary(uint8_t packed_byte, int8_t t_values[5]);
 
-// --- 量化/打包/转换函数 ---
+// Packs 5 encoded ternary values (0, 1, 2) into a single uint8_t using base-3 representation.
+uint8_t pack_five_ternary(const uint8_t t_encoded_values[5]);
+// Unpacks a single uint8_t into 5 encoded ternary values (0, 1, 2).
+void unpack_five_ternary(uint8_t packed_byte, uint8_t t_encoded_values[5]);
+
+// --- Quantization/Packing/Conversion Functions ---
+// Quantizes a block of float values to int8_t values with a fixed scale.
 void quantize_float_to_int8_with_scale(const float* float_ptr, int8_t* int_ptr, size_t size, float fixed_scale);
+// Builds the 5x3-bit look-up table for bit-slice GEMM.
 void build_bit_slice_lut_5x3(std::vector<int16_t>& precomputed_lut);
+
+// Packs unpacked int8_t weights (which are effectively ternary {-1,0,1}) into 5x3-bit packed uint8_t format.
 std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_weights, int original_size);
+// Packs unpacked int8_t activations (which are quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
 std::vector<uint8_t> pack_ternary_activations_5x3bit(const std::vector<int8_t>& unpacked_activations, int original_size);
+
 
 // C++ 端用于将 int8_t 值转换为三值 (-1, 0, 1) 的阈值。
 extern const int8_t C_TERNARY_ACTIVATION_THRESHOLD;
+
+// Converts a single int8_t value to a ternary activation (-1, 0, or 1) based on a threshold.
+// This is the scalar logic for activations (first quantize float to int8, then ternarize).
 inline int8_t convert_int8_to_ternary_activation(int8_t val) {
     if (val > C_TERNARY_ACTIVATION_THRESHOLD) return 1;
     if (val < -C_TERNARY_ACTIVATION_THRESHOLD) return -1;
     return 0; // Values within [-THRESHOLD, THRESHOLD] map to 0
 }
+
+// NEW: Vectorized function to encode a block of already-ternary int8_t values (-1, 0, 1)
+// to 3-bit encoded uint8_t (0, 1, 2). Used for weights.
+void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size);
+
+// NEW: Vectorized function to ternarize a block of int8_t activations (quantized floats)
+// and then encode them to 3-bit encoded uint8_t (0, 1, 2). Used for activations.
+void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size);
+
 
 // --- 激活函数 ---
 void relu(float* vec_ptr, size_t size);

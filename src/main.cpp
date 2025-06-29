@@ -85,6 +85,7 @@ int main() {
             std::copy(w1_int8_unpacked.begin() + i * qat_input_dim,
                       w1_int8_unpacked.begin() + (i + 1) * qat_input_dim,
                       current_row_unpacked.begin());
+            // This call to pack_weights_5x3bit will now use the vectorized encoding internally
             std::vector<uint8_t> packed_row = pack_weights_5x3bit(current_row_unpacked, input_dim_padded);
             q_layer1.packed_weights.insert(q_layer1.packed_weights.end(), packed_row.begin(), packed_row.end());
         }
@@ -97,6 +98,7 @@ int main() {
             std::copy(w2_int8_unpacked.begin() + i * hidden_dim,
                       w2_int8_unpacked.begin() + (i + 1) * hidden_dim,
                       current_row_unpacked.begin());
+            // This call to pack_weights_5x3bit will now use the vectorized encoding internally
             std::vector<uint8_t> packed_row = pack_weights_5x3bit(current_row_unpacked, hidden_dim);
             q_layer2.packed_weights.insert(q_layer2.packed_weights.end(), packed_row.begin(), packed_row.end());
         }
@@ -168,10 +170,12 @@ int main() {
 
         // Buffers for LUT Quantized MLP path
         std::vector<int8_t> batch_input_i8_temp_lut(BATCH_SIZE * input_dim_padded);
-        std::vector<int8_t> batch_input_ternary_L1_lut(BATCH_SIZE * input_dim_padded);
+        // Removed: std::vector<int8_t> batch_input_ternary_L1_lut(BATCH_SIZE * input_dim_padded);
+        // Removed: std::vector<uint8_t> batch_input_encoded_uint8_L1_temp(BATCH_SIZE * input_dim_padded);
         std::vector<uint8_t> batch_input_packed_activations_L1_lut(BATCH_SIZE * ((input_dim_padded + 4) / 5));
         std::vector<float> batch_hidden_q_f32_lut(BATCH_SIZE * hidden_dim);
         std::vector<int8_t> batch_hidden_i8_temp_lut(BATCH_SIZE * hidden_dim);
+        // Removed: std::vector<uint8_t> batch_hidden_encoded_uint8_L2_temp(BATCH_SIZE * hidden_dim);
         std::vector<uint8_t> batch_hidden_packed_activations_L2_lut(BATCH_SIZE * ((hidden_dim + 4) / 5));
         std::vector<float> batch_final_q_lut(BATCH_SIZE * output_dim);
 
@@ -203,26 +207,43 @@ int main() {
             // --- LUT Quantized Model Inference for Batch ---
             auto start_quant_lut = std::chrono::high_resolution_clock::now();
 
-            // L1 input: float -> int8_t -> ternary -> pack
+            // L1 input: float -> int8_t -> pack (pack_ternary_activations_5x3bit internally handles SIMD ternary conversion)
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                quantize_float_to_int8_with_scale(batch_input_f32.data() + k * input_dim_padded, batch_input_i8_temp_lut.data() + k * input_dim_padded, input_dim_padded, q_layer1.activation_scale);
-                for (int l = 0; l < input_dim_padded; ++l) {
-                    batch_input_ternary_L1_lut[k * input_dim_padded + l] = convert_int8_to_ternary_activation(batch_input_i8_temp_lut[k * input_dim_padded + l]);
-                }
-            }
-            for (int k = 0; k < current_batch_actual_size; ++k) {
-                std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(std::vector<int8_t>(batch_input_ternary_L1_lut.begin() + k * input_dim_padded, batch_input_ternary_L1_lut.begin() + (k + 1) * input_dim_padded), input_dim_padded);
-                std::copy(packed_act_sample.begin(), packed_act_sample.end(), batch_input_packed_activations_L1_lut.begin() + k * ((input_dim_padded + 4) / 5));
+                // Quantize float to int8_t
+                quantize_float_to_int8_with_scale(
+                    batch_input_f32.data() + k * input_dim_padded,
+                    batch_input_i8_temp_lut.data() + k * input_dim_padded,
+                    input_dim_padded,
+                    q_layer1.activation_scale
+                );
+                // Pack the int8_t values directly. pack_ternary_activations_5x3bit will perform the SIMD encoding internally.
+                std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(
+                    std::vector<int8_t>(batch_input_i8_temp_lut.begin() + k * input_dim_padded,
+                                         batch_input_i8_temp_lut.begin() + (k + 1) * input_dim_padded),
+                    input_dim_padded
+                );
+                std::copy(packed_act_sample.begin(), packed_act_sample.end(),
+                          batch_input_packed_activations_L1_lut.begin() + k * ((input_dim_padded + 4) / 5));
             }
             lut_linear_forward(q_layer1, batch_input_packed_activations_L1_lut, batch_hidden_q_f32_lut, input_dim_padded, hidden_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
 
-            // L2 input: float -> int8_t (no second ternary conversion needed) -> pack
+            // L2 input: float -> int8_t -> pack (pack_ternary_activations_5x3bit internally handles SIMD ternary conversion)
             for (int k = 0; k < current_batch_actual_size; ++k) {
-                quantize_float_to_int8_with_scale(batch_hidden_q_f32_lut.data() + k * hidden_dim, batch_hidden_i8_temp_lut.data() + k * hidden_dim, hidden_dim, q_layer2.activation_scale);
-            }
-            for (int k = 0; k < current_batch_actual_size; ++k) {
-                 std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(std::vector<int8_t>(batch_hidden_i8_temp_lut.begin() + k * hidden_dim, batch_hidden_i8_temp_lut.begin() + (k + 1) * hidden_dim), hidden_dim);
-                std::copy(packed_act_sample.begin(), packed_act_sample.end(), batch_hidden_packed_activations_L2_lut.begin() + k * ((hidden_dim + 4) / 5));
+                // Quantize float to int8_t
+                quantize_float_to_int8_with_scale(
+                    batch_hidden_q_f32_lut.data() + k * hidden_dim,
+                    batch_hidden_i8_temp_lut.data() + k * hidden_dim,
+                    hidden_dim,
+                    q_layer2.activation_scale
+                );
+                // Pack the int8_t values directly. pack_ternary_activations_5x3bit will perform the SIMD encoding internally.
+                 std::vector<uint8_t> packed_act_sample = pack_ternary_activations_5x3bit(
+                    std::vector<int8_t>(batch_hidden_i8_temp_lut.begin() + k * hidden_dim,
+                                         batch_hidden_i8_temp_lut.begin() + (k + 1) * hidden_dim),
+                    hidden_dim
+                 );
+                std::copy(packed_act_sample.begin(), packed_act_sample.end(),
+                          batch_hidden_packed_activations_L2_lut.begin() + k * ((hidden_dim + 4) / 5));
             }
             lut_linear_forward(q_layer2, batch_hidden_packed_activations_L2_lut, batch_final_q_lut, hidden_dim, output_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
             log_softmax(batch_final_q_lut.data() + 0, output_dim * current_batch_actual_size); // Apply log_softmax to entire batch output
@@ -308,10 +329,12 @@ int main() {
         size_t runtime_buffers_mem_lut =
             batch_input_f32.capacity() * sizeof(float) + // Shared input buffer
             batch_input_i8_temp_lut.capacity() * sizeof(int8_t) +
-            batch_input_ternary_L1_lut.capacity() * sizeof(int8_t) +
+            // Removed: batch_input_ternary_L1_lut.capacity() * sizeof(int8_t) +
+            // Removed: batch_input_encoded_uint8_L1_temp.capacity() * sizeof(uint8_t) +
             batch_input_packed_activations_L1_lut.capacity() * sizeof(uint8_t) +
             batch_hidden_q_f32_lut.capacity() * sizeof(float) +
             batch_hidden_i8_temp_lut.capacity() * sizeof(int8_t) +
+            // Removed: batch_hidden_encoded_uint8_L2_temp.capacity() * sizeof(uint8_t) +
             batch_hidden_packed_activations_L2_lut.capacity() * sizeof(uint8_t) +
             batch_final_q_lut.capacity() * sizeof(float);
 
