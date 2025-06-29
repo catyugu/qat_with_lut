@@ -41,6 +41,10 @@ int32_t avx512_bit_slice_gemm_kernel(
     }
 
     for (int byte_idx_block = 0; byte_idx_block < num_packed_bytes; byte_idx_block += 64) {
+        // Prefetch data for the *next* block of inputs and weights
+        _mm_prefetch(reinterpret_cast<const char*>(input_packed_ptr + byte_idx_block + 64), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(weights_packed_ptr + byte_idx_block + 64), _MM_HINT_T0);
+
         __m512i packed_acts_bytes = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(input_packed_ptr + byte_idx_block));
         __m512i packed_weights_bytes = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(weights_packed_ptr + byte_idx_block));
 
@@ -104,6 +108,10 @@ int32_t avx2_bit_slice_gemm_kernel(
     const int num_packed_bytes = k_dim / 5;
 
     for (int byte_idx_block = 0; byte_idx_block < num_packed_bytes; byte_idx_block += 32) {
+        // Prefetch data for the *next* block of inputs and weights
+        _mm_prefetch(reinterpret_cast<const char*>(input_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(weights_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
+
         alignas(32) uint8_t temp_packed_acts_raw[32];
         alignas(32) uint8_t temp_packed_weights_raw[32];
         alignas(32) int16_t block_sum_of_products[32];
