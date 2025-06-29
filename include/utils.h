@@ -16,6 +16,7 @@ uint8_t encode_ternary_to_3bit_val(int8_t val);
 int8_t decode_3bit_val_to_ternary(uint8_t encoded_val);
 
 // Packs 5 encoded ternary values (0, 1, 2) into a single uint8_t using base-3 representation.
+// This version is now primarily used for building the lookup table.
 uint8_t pack_five_ternary(const uint8_t t_encoded_values[5]);
 // Unpacks a single uint8_t into 5 encoded ternary values (0, 1, 2).
 void unpack_five_ternary(uint8_t packed_byte, uint8_t t_encoded_values[5]);
@@ -30,7 +31,7 @@ void build_bit_slice_lut_5x3(std::vector<int16_t>& precomputed_lut);
 // This version returns a new vector and is mainly for initial model packing.
 std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_weights, int original_size);
 
-// NEW: Packs unpacked int8_t activations (which are quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
+// Packs unpacked int8_t activations (which are quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
 // This version writes directly to a provided output pointer, avoiding dynamic allocations per call.
 void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_ptr, int original_size, uint8_t* output_packed_ptr);
 
@@ -53,6 +54,15 @@ void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size)
 // NEW: Vectorized function to ternarize a block of int8_t activations (quantized floats)
 // and then encode them to 3-bit encoded uint8_t (0, 1, 2). Used for activations.
 void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size);
+
+
+// --- Packing Look-Up Table (LUT) ---
+// Global precomputed LUT for packing 5 3-bit ternary encoded values into a single byte.
+// Size: 3^5 = 243 entries.
+extern std::vector<uint8_t> g_packing_lut;
+
+// Builds the packing lookup table once at startup.
+void build_packing_lut();
 
 
 // --- 激活函数 ---

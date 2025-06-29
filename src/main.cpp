@@ -39,6 +39,10 @@ int main() {
             throw std::runtime_error("Hidden dimension must be a multiple of 160 for AVX2 kernel.");
         }
 
+        // NEW: Build the packing LUT once at startup
+        build_packing_lut();
+        std::cout << "Packing LUT built. Size: " << g_packing_lut.size() * sizeof(uint8_t) / 1024.0 << " KB" << std::endl;
+
 
         // --- 1. Load Model Weights for LUT and Weights-Only Quantized MLPs ---
         // These are loaded from mlp_model_aq.bin (QAT trained model)

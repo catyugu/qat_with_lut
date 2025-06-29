@@ -58,14 +58,37 @@ int32_t avx512_bit_slice_gemm_kernel(
         // Manually unroll the loop by a factor of 8 (64 / 8 = 8 iterations)
         // Original loop was for (int i = 0; i < 64; ++i)
         for (int i = 0; i < 64; i += 8) {
-            block_sum_of_products[i + 0] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 0]) << 8) | temp_packed_weights_raw[i + 0]];
-            block_sum_of_products[i + 1] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 1]) << 8) | temp_packed_weights_raw[i + 1]];
-            block_sum_of_products[i + 2] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 2]) << 8) | temp_packed_weights_raw[i + 2]];
-            block_sum_of_products[i + 3] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 3]) << 8) | temp_packed_weights_raw[i + 3]];
-            block_sum_of_products[i + 4] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 4]) << 8) | temp_packed_weights_raw[i + 4]];
-            block_sum_of_products[i + 5] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 5]) << 8) | temp_packed_weights_raw[i + 5]];
-            block_sum_of_products[i + 6] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 6]) << 8) | temp_packed_weights_raw[i + 6]];
-            block_sum_of_products[i + 7] = precomputed_lut_ptr[(static_cast<uint32_t>(temp_packed_acts_raw[i + 7]) << 8) | temp_packed_weights_raw[i + 7]];
+            uint8_t packed_act_byte_0 = temp_packed_acts_raw[i + 0];
+            uint8_t packed_weight_byte_0 = temp_packed_weights_raw[i + 0];
+            block_sum_of_products[i + 0] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_0) << 8) | packed_weight_byte_0];
+
+            uint8_t packed_act_byte_1 = temp_packed_acts_raw[i + 1];
+            uint8_t packed_weight_byte_1 = temp_packed_weights_raw[i + 1];
+            block_sum_of_products[i + 1] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_1) << 8) | packed_weight_byte_1];
+
+            uint8_t packed_act_byte_2 = temp_packed_acts_raw[i + 2];
+            uint8_t packed_weight_byte_2 = temp_packed_weights_raw[i + 2];
+            block_sum_of_products[i + 2] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_2) << 8) | packed_weight_byte_2];
+
+            uint8_t packed_act_byte_3 = temp_packed_acts_raw[i + 3];
+            uint8_t packed_weight_byte_3 = temp_packed_weights_raw[i + 3];
+            block_sum_of_products[i + 3] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_3) << 8) | packed_weight_byte_3];
+
+            uint8_t packed_act_byte_4 = temp_packed_acts_raw[i + 4];
+            uint8_t packed_weight_byte_4 = temp_packed_weights_raw[i + 4];
+            block_sum_of_products[i + 4] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_4) << 8) | packed_weight_byte_4];
+
+            uint8_t packed_act_byte_5 = temp_packed_acts_raw[i + 5];
+            uint8_t packed_weight_byte_5 = temp_packed_weights_raw[i + 5];
+            block_sum_of_products[i + 5] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_5) << 8) | packed_weight_byte_5];
+
+            uint8_t packed_act_byte_6 = temp_packed_acts_raw[i + 6];
+            uint8_t packed_weight_byte_6 = temp_packed_weights_raw[i + 6];
+            block_sum_of_products[i + 6] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_6) << 8) | packed_weight_byte_6];
+
+            uint8_t packed_act_byte_7 = temp_packed_acts_raw[i + 7];
+            uint8_t packed_weight_byte_7 = temp_packed_weights_raw[i + 7];
+            block_sum_of_products[i + 7] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_7) << 8) | packed_weight_byte_7];
         }
 
         // Accumulate the 64 int16_t results using AVX512 intrinsics
@@ -112,12 +135,15 @@ int32_t avx2_bit_slice_gemm_kernel(
         _mm_prefetch(reinterpret_cast<const char*>(input_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
         _mm_prefetch(reinterpret_cast<const char*>(weights_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
 
+        __m256i packed_acts_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + byte_idx_block));
+        __m256i packed_weights_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + byte_idx_block));
+
         alignas(32) uint8_t temp_packed_acts_raw[32];
         alignas(32) uint8_t temp_packed_weights_raw[32];
         alignas(32) int16_t block_sum_of_products[32];
 
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_acts_raw), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + byte_idx_block)));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_weights_raw), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + byte_idx_block)));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_acts_raw), packed_acts_bytes);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_weights_raw), packed_weights_bytes);
 
         // Manually unroll the loop by a factor of 4 (32 / 4 = 8 iterations)
         // Original loop was for (int i = 0; i < 32; ++i)

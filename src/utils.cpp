@@ -8,7 +8,9 @@
 
 #ifdef __AVX512F__
 #include <immintrin.h> // For AVX512 intrinsics
-#elif __AVX2__
+#endif
+// Explicitly check for __AVX2__ or the custom CMake define for AVX2 features
+#if defined(__AVX2__) || defined(GGML_BITNET_X86_AVX2)
 #include <immintrin.h> // For AVX2 intrinsics
 #endif
 
@@ -16,6 +18,10 @@
 // C++ 端用于将 int8_t 值转换为三值 (-1, 0, 1) 的阈值。
 // 对应 Python 中 TERNARY_THRESHOLD (0.01) * 127.0 = 1.27, 四舍五入为 1
 const int8_t C_TERNARY_ACTIVATION_THRESHOLD = 0;
+
+// Global Packing LUT definition
+std::vector<uint8_t> g_packing_lut;
+
 
 // --- 5x3 bit 编码/解码函数实现 ---
 // Encodes a single ternary value (-1, 0, 1) to its 3-bit representation (0, 1, 2).
@@ -30,11 +36,12 @@ uint8_t encode_ternary_to_3bit_val(int8_t val) {
 int8_t decode_3bit_val_to_ternary(uint8_t encoded_val) {
     if (encoded_val == 0) return -1; // Maps 0 to -1
     if (encoded_val == 1) return 0;  // Maps 1 to 0
-    if (encoded_val == 2) return 1;  // Maps 2 to 1
+    if (encoded_val == 2) return 1;  // Maps 1 to 2
     return 0; // Default for invalid codes
 }
 
 // Packs 5 encoded ternary values (0, 1, 2) into a single uint8_t using base-3 arithmetic.
+// This is now primarily used to BUILD the g_packing_lut.
 uint8_t pack_five_ternary(const uint8_t t_encoded_values[5]) {
     uint8_t packed_byte = 0;
     packed_byte += t_encoded_values[0] * 1;
@@ -89,7 +96,7 @@ void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size)
         output[i] = encode_ternary_to_3bit_val(input[i]);
     }
 }
-#elif __AVX2__
+#elif defined(__AVX2__) || defined(GGML_BITNET_X86_AVX2)
 void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size) {
     const __m256i neg_one_val_simd = _mm256_set1_epi8(-1); // For ternary -1 -> encoded 0
     const __m256i zero_val_simd = _mm256_set1_epi8(0);    // For ternary 0 -> encoded 1
@@ -122,14 +129,14 @@ void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size)
         output[i] = encode_ternary_to_3bit_val(input[i]);
     }
 }
-#else
-// Fallback scalar implementation if no SIMD intrinsics are available
+#else // Fallback scalar implementation if no SIMD intrinsics are available
 void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         output[i] = encode_ternary_to_3bit_val(input[i]);
     }
 }
 #endif
+
 
 // NEW: Vectorized function to ternarize a block of int8_t activations (quantized floats)
 // and then encode them to 3-bit encoded uint8_t (0, 1, 2). Used for activations.
@@ -166,7 +173,7 @@ void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t si
         output[i] = encode_ternary_to_3bit_val(ternary_val);
     }
 }
-#elif __AVX2__
+#elif defined(__AVX2__) || defined(GGML_BITNET_X86_AVX2)
 void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size) {
     const __m256i threshold_pos_vec = _mm256_set1_epi8(C_TERNARY_ACTIVATION_THRESHOLD);
     const __m256i threshold_neg_vec = _mm256_set1_epi8(-C_TERNARY_ACTIVATION_THRESHOLD);
@@ -199,8 +206,7 @@ void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t si
         output[i] = encode_ternary_to_3bit_val(ternary_val);
     }
 }
-#else
-// Fallback scalar implementation if no SIMD intrinsics are available
+#else // Fallback scalar implementation if no SIMD intrinsics are available
 void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         int8_t ternary_val = convert_int8_to_ternary_activation(input[i]);
@@ -280,7 +286,7 @@ std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_wei
     return packed_weights_vec;
 }
 
-// NEW: Packs unpacked int8_t activations (quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
+// Packs unpacked int8_t activations (quantized floats, needs ternarization) into 5x3-bit packed uint8_t format.
 // This version writes directly to a provided output pointer, avoiding dynamic allocations per call.
 void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_ptr, int original_size, uint8_t* output_packed_ptr) {
     std::vector<uint8_t> encoded_unpacked_activations(original_size);
@@ -295,7 +301,13 @@ void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_p
         five_ternary_encoded_vals[pack_idx_in_five] = encoded_unpacked_activations[i];
 
         if (pack_idx_in_five == 4) { // When 5 values are collected
-            output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
+            // Use the precomputed packing LUT instead of pack_five_ternary function call
+            uint8_t index = five_ternary_encoded_vals[0] * 1 +
+                            five_ternary_encoded_vals[1] * 3 +
+                            five_ternary_encoded_vals[2] * 9 +
+                            five_ternary_encoded_vals[3] * 27 +
+                            five_ternary_encoded_vals[4] * 81;
+            output_packed_ptr[packed_idx++] = g_packing_lut[index];
             // Reset buffer for next 5 values
             for(int k=0; k<5; ++k) five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
         }
@@ -306,7 +318,39 @@ void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_p
         for(int k = original_size % 5; k < 5; ++k) {
             five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
         }
-        output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
+        // Use the precomputed packing LUT instead of pack_five_ternary function call
+        uint8_t index = five_ternary_encoded_vals[0] * 1 +
+                        five_ternary_encoded_vals[1] * 3 +
+                        five_ternary_encoded_vals[2] * 9 +
+                        five_ternary_encoded_vals[3] * 27 +
+                        five_ternary_encoded_vals[4] * 81;
+        output_packed_ptr[packed_idx++] = g_packing_lut[index];
+    }
+}
+
+// Builds the packing lookup table once at startup.
+void build_packing_lut() {
+    const int PACK_LUT_SIZE = 243; // 3^5 combinations
+    g_packing_lut.resize(PACK_LUT_SIZE);
+
+    uint8_t t_encoded_values[5];
+    for (int i0 = 0; i0 < 3; ++i0) {
+        for (int i1 = 0; i1 < 3; ++i1) {
+            for (int i2 = 0; i2 < 3; ++i2) {
+                for (int i3 = 0; i3 < 3; ++i3) {
+                    for (int i4 = 0; i4 < 3; ++i4) {
+                        t_encoded_values[0] = i0;
+                        t_encoded_values[1] = i1;
+                        t_encoded_values[2] = i2;
+                        t_encoded_values[3] = i3;
+                        t_encoded_values[4] = i4;
+                        // Calculate the index (same as how it's calculated in pack_five_ternary)
+                        uint8_t index = i0 * 1 + i1 * 3 + i2 * 9 + i3 * 27 + i4 * 81;
+                        g_packing_lut[index] = pack_five_ternary(t_encoded_values);
+                    }
+                }
+            }
+        }
     }
 }
 
