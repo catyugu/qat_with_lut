@@ -6,7 +6,7 @@ import struct
 import os
 
 # 确保此阈值与train_my_mlp.py中定义的TERNARY_THRESHOLD一致
-TERNARY_THRESHOLD = 0.01
+TERNARY_THRESHOLD = 0.001
 
 class TernaryQuantizeSTE(torch.autograd.Function):
     @staticmethod
