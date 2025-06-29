@@ -16,12 +16,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_compile_definitions(GGML_BITNET_X86_TL2)
 add_compile_definitions(GGML_BITNET_X86_AVX2)
 
-# --- 编译我们自己的内核 ---
-add_library(bitnet_kernels STATIC
-        src/ggml-bitnet-lut.cpp
-        src/ggml-bitnet-mad.cpp
-)
-
 # --- 构建最终的主程序 ---
 add_executable(myQATModel
         src/main.cpp
@@ -37,14 +31,10 @@ target_link_libraries(myQATModel PRIVATE
         Threads::Threads  # 线程库
 )
 
-# 解决MSVC编译器关于'getenv'等函数的警告
-if(MSVC)
-    target_compile_definitions(myQATModel PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
-# 添加MSVC编译器优化
-if(MSVC)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(myQATModel PRIVATE -mavx2)
+elseif(MSVC)
     target_compile_options(myQATModel PRIVATE /arch:AVX2)
-    target_compile_options(bitnet_kernels PRIVATE /arch:AVX2)
 endif()
 
 message(STATUS "Project configured successfully. This is the final version.")

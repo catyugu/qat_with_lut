@@ -135,7 +135,7 @@ int main() {
 
 
         // --- 4. Load FashionMNIST Test Data ---
-        const int NUM_TEST_IMAGES = 4000; // FashionMNIST test set size
+        const int NUM_TEST_IMAGES = 10000; // FashionMNIST test set size
         std::vector<float> test_images_f32;
         std::vector<int> test_labels;
 

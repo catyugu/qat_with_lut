@@ -196,10 +196,17 @@ void weights_only_linear_forward(
                 __m512i input_vals_512 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(current_batch_input_ptr + j));
                 __m512i weights_block_512 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(current_neuron_weights_ptr + j));
 
-                __m512i partial_products_i8_512 = _mm512_sign_epi8(input_vals_512, weights_block_512);
+                __m512i input_vals_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(input_vals_512, 0)); // Lower 32 int8_t -> 32 int16_t
+                __m512i weights_block_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(weights_block_512, 0)); // Lower 32 int8_t -> 32 int16_t
+                __m512i partial_sums_lo_16 = _mm512_mullo_epi16(input_vals_lo_16, weights_block_lo_16);
 
-                __m512i partial_sums_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 0));
-                __m512i partial_sums_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 1));
+                __m512i input_vals_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(input_vals_512, 1)); // Higher 32 int8_t -> 32 int16_t
+                __m512i weights_block_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(weights_block_512, 1)); // Higher 32 int8_t -> 32 int16_t
+                __m512i partial_sums_hi_16 = _mm512_mullo_epi16(input_vals_hi_16, weights_block_hi_16);
+
+
+                // __m512i partial_sums_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 0));
+                // __m512i partial_sums_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 1));
 
                 accumulated_sum_vec_32 = _mm512_add_epi32(accumulated_sum_vec_32, _mm512_madd_epi16(partial_sums_lo_16, _mm512_set1_epi16(1)));
                 accumulated_sum_vec_32 = _mm512_add_epi32(accumulated_sum_vec_32, _mm512_madd_epi16(partial_sums_hi_16, _mm512_set1_epi16(1)));
