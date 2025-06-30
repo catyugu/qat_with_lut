@@ -301,15 +301,8 @@ void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_p
         five_ternary_encoded_vals[pack_idx_in_five] = encoded_unpacked_activations[i];
 
         if (pack_idx_in_five == 4) { // When 5 values are collected
-            // Use the precomputed packing LUT instead of pack_five_ternary function call
-            uint8_t index = five_ternary_encoded_vals[0] * 1 +
-                            five_ternary_encoded_vals[1] * 3 +
-                            five_ternary_encoded_vals[2] * 9 +
-                            five_ternary_encoded_vals[3] * 27 +
-                            five_ternary_encoded_vals[4] * 81;
-            output_packed_ptr[packed_idx++] = g_packing_lut[index];
-            // Reset buffer for next 5 values
-            for(int k=0; k<5; ++k) five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
+            // **FIXED**: Perform the packing arithmetic directly, removing dependency on g_packing_lut
+            output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
         }
     }
     // Handle any remaining values if original_size is not a multiple of 5
@@ -318,17 +311,13 @@ void pack_ternary_activations_5x3bit_to_ptr(const int8_t* unpacked_activations_p
         for(int k = original_size % 5; k < 5; ++k) {
             five_ternary_encoded_vals[k] = 1; // Pad with encoded 0
         }
-        // Use the precomputed packing LUT instead of pack_five_ternary function call
-        uint8_t index = five_ternary_encoded_vals[0] * 1 +
-                        five_ternary_encoded_vals[1] * 3 +
-                        five_ternary_encoded_vals[2] * 9 +
-                        five_ternary_encoded_vals[3] * 27 +
-                        five_ternary_encoded_vals[4] * 81;
-        output_packed_ptr[packed_idx++] = g_packing_lut[index];
+        // **FIXED**: Perform the packing arithmetic directly
+        output_packed_ptr[packed_idx++] = pack_five_ternary(five_ternary_encoded_vals);
     }
 }
 
 // Builds the packing lookup table once at startup.
+// NOTE: This function is now unused by the corrected packing logic, but is kept for reference.
 void build_packing_lut() {
     const int PACK_LUT_SIZE = 243; // 3^5 combinations
     g_packing_lut.resize(PACK_LUT_SIZE);
