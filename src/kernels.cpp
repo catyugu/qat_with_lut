@@ -29,7 +29,7 @@ int hsum_i32_16(const __m512i a) {
 int32_t avx512_bit_slice_gemm_kernel(
     const uint8_t* input_packed_ptr,
     const uint8_t* weights_packed_ptr,
-    const int16_t* precomputed_lut_ptr,
+    const int32_t* precomputed_lut_ptr, // <-- CORRECTED: Was int16_t
     int k_dim
 ) {
     __m512i accumulated_sum_vec_32 = _mm512_setzero_si512();
@@ -267,4 +267,3 @@ void standard_linear_forward(
         }
     }
 }
-

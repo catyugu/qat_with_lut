@@ -21,7 +21,8 @@ def convert_mlp_to_simple_binary():
     print(f"Exporting model to: {output_path}")
 
     with open(output_path, 'wb') as f:
-        f.write(b'MLP3')
+        # Use a new magic number 'MLP4' for the updated format
+        f.write(b'MLP4')
         input_dim, hidden_dim, output_dim = 784, 320, 10
         f.write(struct.pack('iii', input_dim, hidden_dim, output_dim))
         state_dict = model.state_dict()
@@ -32,18 +33,13 @@ def convert_mlp_to_simple_binary():
         f.write(w1_ternary.tobytes())
         f.write(state_dict['fc1.bias'].numpy().astype(np.float32).tobytes())
 
-        # Activation Scales
-        # Scale for input to first layer (images normalized to [-1, 1])
-        input_to_fc1_scale = 127.0
-        f.write(struct.pack('f', input_to_fc1_scale))
-
-        # --- EXPORT LEARNED SCALE ---
-        # Scale for input to second layer (activations from fc1)
-        # This is now calculated based on the learned `running_abs_max` from our QAT module.
+        # --- EXPORT THE SINGLE LEARNED ACTIVATION SCALE ---
+        # This is the scale for the activations between fc1 and fc2.
+        # The scale for the input layer is fixed and will be hardcoded in the C++ app.
         learned_abs_max = state_dict['activation.running_abs_max'].item()
-        input_to_fc2_scale = 127.0 / learned_abs_max
-        print(f"Exporting learned `input_to_fc2_scale`: {input_to_fc2_scale:.4f}")
-        f.write(struct.pack('f', input_to_fc2_scale))
+        hidden_activation_scale = 127.0 / learned_abs_max
+        print(f"Exporting the single learned hidden activation scale: {hidden_activation_scale:.4f}")
+        f.write(struct.pack('f', hidden_activation_scale))
 
         # Layer 2 weights and bias
         w2_float = state_dict['fc2.weight']
@@ -51,7 +47,7 @@ def convert_mlp_to_simple_binary():
         f.write(w2_ternary.tobytes())
         f.write(state_dict['fc2.bias'].numpy().astype(np.float32).tobytes())
 
-    print(f"\nModel successfully exported to {output_path}.")
+    print(f"\nModel successfully exported to {output_path} with the new format (MLP4).")
 
 if __name__ == '__main__':
     convert_mlp_to_simple_binary()
