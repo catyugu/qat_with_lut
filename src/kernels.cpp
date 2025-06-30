@@ -258,28 +258,13 @@ void standard_linear_forward(
     for (int b = 0; b < batch_size; ++b) {
         const float* current_batch_input_ptr = input_f32_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
+            float sum = 0.0f;
             const float* current_neuron_weights_ptr = layer.weights.data() + i * input_dim;
-
-            __m256 sum_vec = _mm256_setzero_ps();
-            int j = 0;
-            for (; j + 7 < input_dim; j += 8) {
-                __m256 w = _mm256_loadu_ps(current_neuron_weights_ptr + j);
-                __m256 a = _mm256_loadu_ps(current_batch_input_ptr + j);
-                // Fused Multiply-Add for potential slight performance gain
-                sum_vec = _mm256_fmadd_ps(w, a, sum_vec);
-            }
-
-            // Horizontal sum
-            float buffer[8];
-            _mm256_storeu_ps(buffer, sum_vec);
-            float sum = buffer[0] + buffer[1] + buffer[2] + buffer[3] + buffer[4] + buffer[5] + buffer[6] + buffer[7];
-
-            // Handle remaining elements
-            for (; j < input_dim; ++j) {
+            for (int j = 0; j < input_dim; ++j) {
                 sum += current_neuron_weights_ptr[j] * current_batch_input_ptr[j];
             }
-
             output_f32_batched[b * output_dim + i] = sum + layer.bias[i];
         }
     }
 }
+
