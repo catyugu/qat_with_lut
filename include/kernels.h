@@ -19,7 +19,7 @@ int hsum_i32_16(const __m512i a);
 int32_t avx512_bit_slice_gemm_kernel(
     const uint8_t* input_packed_ptr,
     const uint8_t* weights_packed_ptr,
-    const int16_t* precomputed_lut_ptr,
+    const int32_t* precomputed_lut_ptr, // Changed to int32_t
     int k_dim
 );
 
@@ -34,7 +34,7 @@ int hsum_i32_8(const __m256i a);
 int32_t avx2_bit_slice_gemm_kernel(
     const uint8_t* input_packed_ptr,
     const uint8_t* weights_packed_ptr,
-    const int16_t* precomputed_lut_ptr,
+    const int32_t* precomputed_lut_ptr, // Changed to int32_t
     int k_dim
 );
 
@@ -52,7 +52,7 @@ void lut_linear_forward(
     int input_dim,
     int output_dim,
     int batch_size,
-    const int16_t* precomputed_lut_ptr
+    const int32_t* precomputed_lut_ptr // Changed to int32_t
 );
 
 // 仅权重量化 MLP 前向传播

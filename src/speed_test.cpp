@@ -112,9 +112,8 @@ int main(int argc, char* argv[]) {
     pack_ternary_activations_5x3bit_to_ptr(input_i8.data(), input_dim, input_packed.data());
 
     // --- Build LUT ---
-    std::vector<int16_t> precomputed_lut;
+    std::vector<int32_t> precomputed_lut;
     build_bit_slice_lut_5x3(precomputed_lut);
-    build_packing_lut();
 
 
     // --- Outputs ---

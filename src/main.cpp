@@ -39,8 +39,6 @@ int main() {
             throw std::runtime_error("Hidden dimension must be a multiple of 160 for AVX2 kernel.");
         }
 
-        // NEW: Build the packing LUT once at startup
-        build_packing_lut();
         std::cout << "Packing LUT built. Size: " << g_packing_lut.size() * sizeof(uint8_t) / 1024.0 << " KB" << std::endl;
 
 
@@ -109,10 +107,10 @@ int main() {
         q_layer2.bias = b2;
         q_layer2.activation_scale = input_to_fc2_scale;
 
-        // --- NEW: Global Precomputed LUT ---
-        std::vector<int16_t> precomputed_bit_slice_lut;
+        std::vector<int32_t> precomputed_bit_slice_lut; // CORRECTED to int32_t
         build_bit_slice_lut_5x3(precomputed_bit_slice_lut); // Build the LUT once at startup
-        std::cout << "Bit-Slice LUT built. Size: " << precomputed_bit_slice_lut.size() * sizeof(int16_t) / 1024.0 << " KB" << std::endl;
+        std::cout << "Bit-Slice LUT built. Size: " << precomputed_bit_slice_lut.size() * sizeof(int32_t) / 1024.0 << " KB" << std::endl;
+
 
 
         // 3b. Weights-Only Quant MLP Model (unpacked ternary weights, int8_t activations)

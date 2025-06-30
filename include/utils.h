@@ -25,8 +25,7 @@ void unpack_five_ternary(uint8_t packed_byte, uint8_t t_encoded_values[5]);
 // Quantizes a block of float values to int8_t values with a fixed scale.
 void quantize_float_to_int8_with_scale(const float* float_ptr, int8_t* int_ptr, size_t size, float fixed_scale);
 // Builds the 5x3-bit look-up table for bit-slice GEMM.
-void build_bit_slice_lut_5x3(std::vector<int16_t>& precomputed_lut);
-
+void build_bit_slice_lut_5x3(std::vector<int32_t>& precomputed_lut); // Changed to int32_t
 // Packs unpacked int8_t weights (which are effectively ternary {-1,0,1}) into 5x3-bit packed uint8_t format.
 // This version returns a new vector and is mainly for initial model packing.
 std::vector<uint8_t> pack_weights_5x3bit(const std::vector<int8_t>& unpacked_weights, int original_size);
@@ -60,10 +59,6 @@ void ternarize_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t si
 // Global precomputed LUT for packing 5 3-bit ternary encoded values into a single byte.
 // Size: 3^5 = 243 entries.
 extern std::vector<uint8_t> g_packing_lut;
-
-// Builds the packing lookup table once at startup.
-void build_packing_lut();
-
 
 // --- 激活函数 ---
 void relu(float* vec_ptr, size_t size);

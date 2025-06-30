@@ -119,80 +119,53 @@ int hsum_i32_8(const __m256i a) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 
-// **NEW, ACCELERATED KERNEL**
-// Bit-Slice GEMM kernel using AVX2 intrinsics (LUT-based)
+
 int32_t avx2_bit_slice_gemm_kernel(
     const uint8_t* input_packed_ptr,
     const uint8_t* weights_packed_ptr,
-    const int16_t* precomputed_lut_ptr,
+    const int32_t* precomputed_lut_ptr, // Changed to int32_t
     int k_dim
 ) {
     __m256i accumulated_sum_vec = _mm256_setzero_si256();
     const int num_packed_bytes = k_dim / 5;
 
-    // We process 32 packed bytes per iteration. This corresponds to 160 original elements.
     for (int j = 0; j < num_packed_bytes; j += 32) {
-        // Load 32 packed bytes for both activations and weights
         __m256i packed_acts_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + j));
         __m256i packed_weights_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + j));
 
-        // --- Unpack 32 bytes into 4 vectors of 8 32-bit integers for indexing ---
-        // We do this because i32gather operates on 32-bit indices.
+        // Unpack bytes to 32-bit indices for gather
+        __m128i p_acts_lo = _mm256_castsi256_si128(packed_acts_vec);
+        __m128i p_acts_hi = _mm256_extracti128_si256(packed_acts_vec, 1);
+        __m256i acts_idx1 = _mm256_cvtepu8_epi32(p_acts_lo);
+        __m256i acts_idx2 = _mm256_cvtepu8_epi32(_mm_srli_si128(p_acts_lo, 8));
+        __m256i acts_idx3 = _mm256_cvtepu8_epi32(p_acts_hi);
+        __m256i acts_idx4 = _mm256_cvtepu8_epi32(_mm_srli_si128(p_acts_hi, 8));
 
-        // Low 128 bits of activations
-        __m128i packed_acts_low128 = _mm256_castsi256_si128(packed_acts_vec);
-        // High 128 bits of activations
-        __m128i packed_acts_high128 = _mm256_extracti128_si256(packed_acts_vec, 1);
+        __m128i p_weights_lo = _mm256_castsi256_si128(packed_weights_vec);
+        __m128i p_weights_hi = _mm256_extracti128_si256(packed_weights_vec, 1);
+        __m256i weights_idx1 = _mm256_cvtepu8_epi32(p_weights_lo);
+        __m256i weights_idx2 = _mm256_cvtepu8_epi32(_mm_srli_si128(p_weights_lo, 8));
+        __m256i weights_idx3 = _mm256_cvtepu8_epi32(p_weights_hi);
+        __m256i weights_idx4 = _mm256_cvtepu8_epi32(_mm_srli_si128(p_weights_hi, 8));
 
-        // Unpack low 128 bits of activations into two 32-bit integer vectors
-        __m256i acts_indices1 = _mm256_cvtepu8_epi32(packed_acts_low128);
-        __m128i packed_acts_low128_shifted = _mm_srli_si128(packed_acts_low128, 8);
-        __m256i acts_indices2 = _mm256_cvtepu8_epi32(packed_acts_low128_shifted);
+        // Combine indices: final_idx = (act_idx << 8) | weight_idx
+        const __m256i shift_8 = _mm256_set1_epi32(256);
+        __m256i final_idx1 = _mm256_or_si256(_mm256_mullo_epi32(acts_idx1, shift_8), weights_idx1);
+        __m256i final_idx2 = _mm256_or_si256(_mm256_mullo_epi32(acts_idx2, shift_8), weights_idx2);
+        __m256i final_idx3 = _mm256_or_si256(_mm256_mullo_epi32(acts_idx3, shift_8), weights_idx3);
+        __m256i final_idx4 = _mm256_or_si256(_mm256_mullo_epi32(acts_idx4, shift_8), weights_idx4);
 
-        // Unpack high 128 bits of activations into two 32-bit integer vectors
-        __m256i acts_indices3 = _mm256_cvtepu8_epi32(packed_acts_high128);
-        __m128i packed_acts_high128_shifted = _mm_srli_si128(packed_acts_high128, 8);
-        __m256i acts_indices4 = _mm256_cvtepu8_epi32(packed_acts_high128_shifted);
+        // Gather 32-bit values from the LUT using a scale of 4 bytes
+        __m256i gathered1 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_idx1, 4);
+        __m256i gathered2 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_idx2, 4);
+        __m256i gathered3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_idx3, 4);
+        __m256i gathered4 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_idx4, 4);
 
-        // Low 128 bits of weights
-        __m128i packed_weights_low128 = _mm256_castsi256_si128(packed_weights_vec);
-        // High 128 bits of weights
-        __m128i packed_weights_high128 = _mm256_extracti128_si256(packed_weights_vec, 1);
-
-        // Unpack low 128 bits of weights into two 32-bit integer vectors
-        __m256i weights_indices1 = _mm256_cvtepu8_epi32(packed_weights_low128);
-        __m128i packed_weights_low128_shifted = _mm_srli_si128(packed_weights_low128, 8);
-        __m256i weights_indices2 = _mm256_cvtepu8_epi32(packed_weights_low128_shifted);
-
-        // Unpack high 128 bits of weights into two 32-bit integer vectors
-        __m256i weights_indices3 = _mm256_cvtepu8_epi32(packed_weights_high128);
-        __m128i packed_weights_high128_shifted = _mm_srli_si128(packed_weights_high128, 8);
-        __m256i weights_indices4 = _mm256_cvtepu8_epi32(packed_weights_high128_shifted);
-
-        // --- Combine activation and weight indices to form the final LUT index ---
-        // Final Index = (activation_index << 8) | weight_index
-        const __m256i shift_by_8 = _mm256_set1_epi32(256); // 1 << 8
-        __m256i final_indices1 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices1, shift_by_8), weights_indices1);
-        __m256i final_indices2 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices2, shift_by_8), weights_indices2);
-        __m256i final_indices3 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices3, shift_by_8), weights_indices3);
-        __m256i final_indices4 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices4, shift_by_8), weights_indices4);
-
-        // --- Gather values from LUT using the calculated indices ---
-        // The scale for i32gather is 2 because our LUT contains 16-bit integers (2 bytes).
-        __m256i gathered_vals1 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices1, 2);
-        __m256i gathered_vals2 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices2, 2);
-        __m256i gathered_vals3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices3, 2);
-        __m256i gathered_vals4 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices4, 2);
-
-        // --- Accumulate the results ---
-        // Since the gathered values are 16-bit products, we need to handle them carefully.
-        // We can add pairs of them together.
-        __m256i sum12 = _mm256_add_epi32(gathered_vals1, gathered_vals2);
-        __m256i sum34 = _mm256_add_epi32(gathered_vals3, gathered_vals4);
+        // Accumulate results
+        __m256i sum12 = _mm256_add_epi32(gathered1, gathered2);
+        __m256i sum34 = _mm256_add_epi32(gathered3, gathered4);
         accumulated_sum_vec = _mm256_add_epi32(accumulated_sum_vec, _mm256_add_epi32(sum12, sum34));
     }
-
-    // Horizontally sum the final vector to get the single dot product result.
     return hsum_i32_8(accumulated_sum_vec);
 }
 
@@ -208,32 +181,22 @@ void lut_linear_forward(
     int input_dim,
     int output_dim,
     int batch_size,
-    const int16_t* precomputed_lut_ptr
+    const int32_t* precomputed_lut_ptr // Changed to int32_t
 ) {
     output_f32_batched.resize(batch_size * output_dim);
     const uint8_t* weights_packed_ptr = layer.packed_weights.data();
     const int packed_input_bytes_per_sample = (input_dim + 4) / 5;
     for (int b = 0; b < batch_size; ++b) {
         const uint8_t* current_batch_input_packed_ptr = input_packed_batched.data() + b * packed_input_bytes_per_sample;
-        for (int i = 0; i < output_dim; ++i) { // Fixed loop condition
+        for (int i = 0; i < output_dim; ++i) {
             const uint8_t* current_neuron_weights_packed_ptr = weights_packed_ptr + i * packed_input_bytes_per_sample;
-            int32_t sum = 0;
 
-#ifdef __AVX512F__
-            sum = avx512_bit_slice_gemm_kernel(
+            int32_t sum = avx2_bit_slice_gemm_kernel(
                 current_batch_input_packed_ptr,
                 current_neuron_weights_packed_ptr,
                 precomputed_lut_ptr,
                 input_dim
             );
-#else // Fallback to AVX2
-            sum = avx2_bit_slice_gemm_kernel(
-                current_batch_input_packed_ptr,
-                current_neuron_weights_packed_ptr,
-                precomputed_lut_ptr,
-                input_dim
-            );
-#endif
             output_f32_batched[b * output_dim + i] = (static_cast<float>(sum) / layer.activation_scale) + layer.bias[i];
         }
     }
@@ -252,50 +215,32 @@ void weights_only_linear_forward(
     for (int b = 0; b < batch_size; ++b) {
         const int8_t* current_batch_input_ptr = input_i8_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
-            int32_t sum = 0;
             const int8_t* current_neuron_weights_ptr = weights_ptr + i * input_dim;
 
-#ifdef __AVX512F__
-            __m512i accumulated_sum_vec_32 = _mm512_setzero_si512();
-
-            for (int j = 0; j < input_dim; j += 64) {
-                __m512i input_vals_512 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(current_batch_input_ptr + j));
-                __m512i weights_block_512 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(current_neuron_weights_ptr + j));
-
-                __m512i input_vals_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(input_vals_512, 0)); // Lower 32 int8_t -> 32 int16_t
-                __m512i weights_block_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(weights_block_512, 0)); // Lower 32 int8_t -> 32 int16_t
-                __m512i partial_sums_lo_16 = _mm512_mullo_epi16(input_vals_lo_16, weights_block_lo_16);
-
-                __m512i input_vals_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(input_vals_512, 1)); // Higher 32 int8_t -> 32 int16_t
-                __m512i weights_block_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(weights_block_512, 1)); // Higher 32 int8_t -> 32 int16_t
-                __m512i partial_sums_hi_16 = _mm512_mullo_epi16(input_vals_hi_16, weights_block_hi_16);
-
-
-                // __m512i partial_sums_lo_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 0));
-                // __m512i partial_sums_hi_16 = _mm512_cvtepi8_epi16(_mm512_extracti32x8_epi32(partial_products_i8_512, 1));
-
-                accumulated_sum_vec_32 = _mm512_add_epi32(accumulated_sum_vec_32, _mm512_madd_epi16(partial_sums_lo_16, _mm512_set1_epi16(1)));
-                accumulated_sum_vec_32 = _mm512_add_epi32(accumulated_sum_vec_32, _mm512_madd_epi16(partial_sums_hi_16, _mm512_set1_epi16(1)));
-            }
-            sum = hsum_i32_16(accumulated_sum_vec_32);
-
-#else // Fallback to AVX2 if AVX512F is not defined
             __m256i accumulated_sum_vec_32 = _mm256_setzero_si256();
 
+            // **CORRECTED KERNEL LOGIC**
             for (int j = 0; j < input_dim; j += 32) {
-                __m256i input_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_batch_input_ptr + j));
-                __m256i weights_block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current_neuron_weights_ptr + j));
+                // Load 16 bytes (128 bits) at a time
+                __m128i input_i8_1 = _mm_loadu_si128((__m128i const*)(current_batch_input_ptr + j));
+                __m128i weights_i8_1 = _mm_loadu_si128((__m128i const*)(current_neuron_weights_ptr + j));
+                __m128i input_i8_2 = _mm_loadu_si128((__m128i const*)(current_batch_input_ptr + j + 16));
+                __m128i weights_i8_2 = _mm_loadu_si128((__m128i const*)(current_neuron_weights_ptr + j + 16));
 
-                __m256i partial_products_i8 = _mm256_sign_epi8(input_vals, weights_block);
+                // Convert int8 to int16
+                __m256i input_i16_1 = _mm256_cvtepi8_epi16(input_i8_1);
+                __m256i weights_i16_1 = _mm256_cvtepi8_epi16(weights_i8_1);
+                __m256i input_i16_2 = _mm256_cvtepi8_epi16(input_i8_2);
+                __m256i weights_i16_2 = _mm256_cvtepi8_epi16(weights_i8_2);
 
-                __m256i partial_sums_lo_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products_i8, 0));
-                __m256i partial_sums_hi_16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(partial_products_i8, 1));
+                // Multiply and horizontally add adjacent pairs, results in int32
+                __m256i mad1 = _mm256_madd_epi16(input_i16_1, weights_i16_1);
+                __m256i mad2 = _mm256_madd_epi16(input_i16_2, weights_i16_2);
 
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums_lo_16, _mm256_set1_epi16(1)));
-                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_madd_epi16(partial_sums_hi_16, _mm256_set1_epi16(1)));
+                // Accumulate the int32 results
+                accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_add_epi32(mad1, mad2));
             }
-            sum = hsum_i32_8(accumulated_sum_vec_32);
-#endif
+            int32_t sum = hsum_i32_8(accumulated_sum_vec_32);
             output_f32_batched[b * output_dim + i] = (static_cast<float>(sum) / layer.activation_scale) + layer.bias[i];
         }
     }
@@ -313,11 +258,27 @@ void standard_linear_forward(
     for (int b = 0; b < batch_size; ++b) {
         const float* current_batch_input_ptr = input_f32_batched.data() + b * input_dim;
         for (int i = 0; i < output_dim; ++i) {
-            float sum = 0.0f;
             const float* current_neuron_weights_ptr = layer.weights.data() + i * input_dim;
-            for (int j = 0; j < input_dim; ++j) {
+
+            __m256 sum_vec = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 7 < input_dim; j += 8) {
+                __m256 w = _mm256_loadu_ps(current_neuron_weights_ptr + j);
+                __m256 a = _mm256_loadu_ps(current_batch_input_ptr + j);
+                // Fused Multiply-Add for potential slight performance gain
+                sum_vec = _mm256_fmadd_ps(w, a, sum_vec);
+            }
+
+            // Horizontal sum
+            float buffer[8];
+            _mm256_storeu_ps(buffer, sum_vec);
+            float sum = buffer[0] + buffer[1] + buffer[2] + buffer[3] + buffer[4] + buffer[5] + buffer[6] + buffer[7];
+
+            // Handle remaining elements
+            for (; j < input_dim; ++j) {
                 sum += current_neuron_weights_ptr[j] * current_batch_input_ptr[j];
             }
+
             output_f32_batched[b * output_dim + i] = sum + layer.bias[i];
         }
     }
