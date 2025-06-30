@@ -119,6 +119,7 @@ int hsum_i32_8(const __m256i a) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 
+// **NEW, ACCELERATED KERNEL**
 // Bit-Slice GEMM kernel using AVX2 intrinsics (LUT-based)
 int32_t avx2_bit_slice_gemm_kernel(
     const uint8_t* input_packed_ptr,
@@ -126,59 +127,73 @@ int32_t avx2_bit_slice_gemm_kernel(
     const int16_t* precomputed_lut_ptr,
     int k_dim
 ) {
-    __m256i accumulated_sum_vec_32 = _mm256_setzero_si256();
-
+    __m256i accumulated_sum_vec = _mm256_setzero_si256();
     const int num_packed_bytes = k_dim / 5;
 
-    for (int byte_idx_block = 0; byte_idx_block < num_packed_bytes; byte_idx_block += 32) {
-        // Prefetch data for the *next* block of inputs and weights
-        _mm_prefetch(reinterpret_cast<const char*>(input_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
-        _mm_prefetch(reinterpret_cast<const char*>(weights_packed_ptr + byte_idx_block + 32), _MM_HINT_T0);
+    // We process 32 packed bytes per iteration. This corresponds to 160 original elements.
+    for (int j = 0; j < num_packed_bytes; j += 32) {
+        // Load 32 packed bytes for both activations and weights
+        __m256i packed_acts_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + j));
+        __m256i packed_weights_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + j));
 
-        __m256i packed_acts_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_packed_ptr + byte_idx_block));
-        __m256i packed_weights_bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights_packed_ptr + byte_idx_block));
+        // --- Unpack 32 bytes into 4 vectors of 8 32-bit integers for indexing ---
+        // We do this because i32gather operates on 32-bit indices.
 
-        alignas(32) uint8_t temp_packed_acts_raw[32];
-        alignas(32) uint8_t temp_packed_weights_raw[32];
-        alignas(32) int16_t block_sum_of_products[32];
+        // Low 128 bits of activations
+        __m128i packed_acts_low128 = _mm256_castsi256_si128(packed_acts_vec);
+        // High 128 bits of activations
+        __m128i packed_acts_high128 = _mm256_extracti128_si256(packed_acts_vec, 1);
 
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_acts_raw), packed_acts_bytes);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(temp_packed_weights_raw), packed_weights_bytes);
+        // Unpack low 128 bits of activations into two 32-bit integer vectors
+        __m256i acts_indices1 = _mm256_cvtepu8_epi32(packed_acts_low128);
+        __m128i packed_acts_low128_shifted = _mm_srli_si128(packed_acts_low128, 8);
+        __m256i acts_indices2 = _mm256_cvtepu8_epi32(packed_acts_low128_shifted);
 
-        // Manually unroll the loop by a factor of 4 (32 / 4 = 8 iterations)
-        // Original loop was for (int i = 0; i < 32; ++i)
-        for (int i = 0; i < 32; i += 4) {
-            uint8_t packed_act_byte_0 = temp_packed_acts_raw[i + 0];
-            uint8_t packed_weight_byte_0 = temp_packed_weights_raw[i + 0];
-            block_sum_of_products[i + 0] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_0) << 8) | packed_weight_byte_0];
+        // Unpack high 128 bits of activations into two 32-bit integer vectors
+        __m256i acts_indices3 = _mm256_cvtepu8_epi32(packed_acts_high128);
+        __m128i packed_acts_high128_shifted = _mm_srli_si128(packed_acts_high128, 8);
+        __m256i acts_indices4 = _mm256_cvtepu8_epi32(packed_acts_high128_shifted);
 
-            uint8_t packed_act_byte_1 = temp_packed_acts_raw[i + 1];
-            uint8_t packed_weight_byte_1 = temp_packed_weights_raw[i + 1];
-            block_sum_of_products[i + 1] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_1) << 8) | packed_weight_byte_1];
+        // Low 128 bits of weights
+        __m128i packed_weights_low128 = _mm256_castsi256_si128(packed_weights_vec);
+        // High 128 bits of weights
+        __m128i packed_weights_high128 = _mm256_extracti128_si256(packed_weights_vec, 1);
 
-            uint8_t packed_act_byte_2 = temp_packed_acts_raw[i + 2];
-            uint8_t packed_weight_byte_2 = temp_packed_weights_raw[i + 2];
-            block_sum_of_products[i + 2] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_2) << 8) | packed_weight_byte_2];
+        // Unpack low 128 bits of weights into two 32-bit integer vectors
+        __m256i weights_indices1 = _mm256_cvtepu8_epi32(packed_weights_low128);
+        __m128i packed_weights_low128_shifted = _mm_srli_si128(packed_weights_low128, 8);
+        __m256i weights_indices2 = _mm256_cvtepu8_epi32(packed_weights_low128_shifted);
 
-            uint8_t packed_act_byte_3 = temp_packed_acts_raw[i + 3];
-            uint8_t packed_weight_byte_3 = temp_packed_weights_raw[i + 3];
-            block_sum_of_products[i + 3] = precomputed_lut_ptr[(static_cast<uint32_t>(packed_act_byte_3) << 8) | packed_weight_byte_3];
-        }
+        // Unpack high 128 bits of weights into two 32-bit integer vectors
+        __m256i weights_indices3 = _mm256_cvtepu8_epi32(packed_weights_high128);
+        __m128i packed_weights_high128_shifted = _mm_srli_si128(packed_weights_high128, 8);
+        __m256i weights_indices4 = _mm256_cvtepu8_epi32(packed_weights_high128_shifted);
 
-        __m256i sum_of_products_vec0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_sum_of_products));
-        __m256i sum_of_products_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_sum_of_products + 16));
+        // --- Combine activation and weight indices to form the final LUT index ---
+        // Final Index = (activation_index << 8) | weight_index
+        const __m256i shift_by_8 = _mm256_set1_epi32(256); // 1 << 8
+        __m256i final_indices1 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices1, shift_by_8), weights_indices1);
+        __m256i final_indices2 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices2, shift_by_8), weights_indices2);
+        __m256i final_indices3 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices3, shift_by_8), weights_indices3);
+        __m256i final_indices4 = _mm256_or_si256(_mm256_mullo_epi32(acts_indices4, shift_by_8), weights_indices4);
 
-        __m256i sum_lo_32_0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(sum_of_products_vec0, 0));
-        __m256i sum_hi_32_0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(sum_of_products_vec0, 1));
-        accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, sum_lo_32_0);
-        accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, sum_hi_32_0);
+        // --- Gather values from LUT using the calculated indices ---
+        // The scale for i32gather is 2 because our LUT contains 16-bit integers (2 bytes).
+        __m256i gathered_vals1 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices1, 2);
+        __m256i gathered_vals2 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices2, 2);
+        __m256i gathered_vals3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices3, 2);
+        __m256i gathered_vals4 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(precomputed_lut_ptr), final_indices4, 2);
 
-        __m256i sum_lo_32_1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(sum_of_products_vec1, 0));
-        __m256i sum_hi_32_1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(sum_of_products_vec1, 1));
-        accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, sum_lo_32_1);
-        accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, sum_hi_32_1);
+        // --- Accumulate the results ---
+        // Since the gathered values are 16-bit products, we need to handle them carefully.
+        // We can add pairs of them together.
+        __m256i sum12 = _mm256_add_epi32(gathered_vals1, gathered_vals2);
+        __m256i sum34 = _mm256_add_epi32(gathered_vals3, gathered_vals4);
+        accumulated_sum_vec = _mm256_add_epi32(accumulated_sum_vec, _mm256_add_epi32(sum12, sum34));
     }
-    return hsum_i32_8(accumulated_sum_vec_32);
+
+    // Horizontally sum the final vector to get the single dot product result.
+    return hsum_i32_8(accumulated_sum_vec);
 }
 
 #endif // __AVX512F__
