@@ -255,21 +255,27 @@ int main() {
             lut_linear_forward(q_layer1, batch_input_packed_activations_L1_lut, batch_hidden_q_f32_lut, input_dim_padded, hidden_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
 
             // L2 input: float -> int8_t -> pack (still needs to be done for hidden layer activations)
-            for (int k = 0; k < current_batch_actual_size; ++k) {
+                for(int k = 0; k < current_batch_actual_size; ++k) {
+                // 1. Quantize float -> int8 using the learned scale
                 quantize_float_to_int8_with_scale(
                     batch_hidden_q_f32_lut.data() + k * hidden_dim,
                     batch_hidden_i8_temp_lut.data() + k * hidden_dim,
                     hidden_dim,
-                    q_layer2.activation_scale
+                    q_layer1.activation_scale // This is the learned scale
                 );
-                // NEW: Use the modified packing function that writes to a pointer
+                // 2. Pack the resulting int8 (which contains ternarized values)
                 pack_ternary_activations_5x3bit_to_ptr(
                     batch_hidden_i8_temp_lut.data() + k * hidden_dim,
                     hidden_dim,
                     batch_hidden_packed_activations_L2_lut.data() + k * ((hidden_dim + 4) / 5)
-                 );
+                );
             }
-            lut_linear_forward(q_layer2, batch_hidden_packed_activations_L2_lut, batch_final_q_lut, hidden_dim, output_dim, current_batch_actual_size, precomputed_bit_slice_lut.data());
+            lut_linear_forward(q_layer2, batch_hidden_packed_activations_L2_lut,
+                batch_final_q_lut,
+                hidden_dim,
+                output_dim,
+                current_batch_actual_size,
+                precomputed_bit_slice_lut.data());
             log_softmax(batch_final_q_lut.data() + 0, output_dim * current_batch_actual_size); // Apply log_softmax to entire batch output
 
             auto end_quant_lut = std::chrono::high_resolution_clock::now();
@@ -289,16 +295,21 @@ int main() {
             // L1 input: directly use pre-quantized activations
             weights_only_linear_forward(wo_q_layer1, batch_input_i8_wo, batch_hidden_q_f32_wo, input_dim_padded, hidden_dim, current_batch_actual_size);
 
-            // ReLU on float output
-            for (int k = 0; k < current_batch_actual_size; ++k) {
-                relu(batch_hidden_q_f32_wo.data() + k * hidden_dim, hidden_dim);
+            // **CORRECTED LOGIC**: Ternarize hidden activations instead of using ReLU, to match Python QAT script.
+            for(int k = 0; k < current_batch_actual_size; ++k) {
+                quantize_float_to_int8_with_scale(
+                    batch_hidden_q_f32_wo.data() + k * hidden_dim,
+                    batch_hidden_i8_wo.data() + k * hidden_dim,
+                    hidden_dim,
+                    1.0f
+                );
             }
-
-            // L2 input: float -> int8_t (still needs to be done for hidden layer activations)
-            for (int k = 0; k < current_batch_actual_size; ++k) {
-                quantize_float_to_int8_with_scale(batch_hidden_q_f32_wo.data() + k * hidden_dim, batch_hidden_i8_wo.data() + k * hidden_dim, hidden_dim, wo_q_layer2.activation_scale);
-            }
-            weights_only_linear_forward(wo_q_layer2, batch_hidden_i8_wo, batch_final_q_wo, hidden_dim, output_dim, current_batch_actual_size);
+            weights_only_linear_forward(wo_q_layer2,
+                batch_hidden_i8_wo,
+                batch_final_q_wo,
+                hidden_dim,
+                output_dim,
+                current_batch_actual_size);
             log_softmax(batch_final_q_wo.data() + 0, output_dim * current_batch_actual_size);
 
             auto end_quant_wo = std::chrono::high_resolution_clock::now();
