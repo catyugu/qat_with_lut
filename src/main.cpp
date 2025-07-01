@@ -257,6 +257,29 @@ int main() {
         std::cout << "Accuracy (%)        | " << std::setw(18) << quant_lut_accuracy << " | " << std::setw(18) << quant_wo_accuracy << " | " << std::setw(20) << float_fp_accuracy << std::endl;
         std::cout << "-------------------------------------------------------------" << std::endl;
 
+        // --- NEW: Memory Cost Comparison ---
+        double float_mem = (double)(f_layer1.weights.size() * sizeof(float) + f_layer1.bias.size() * sizeof(float) +
+                                    f_layer2.weights.size() * sizeof(float) + f_layer2.bias.size() * sizeof(float)) / 1024.0;
+
+        double wo_mem = (double)(wo_q_layer1.weights.size() * sizeof(int8_t) + wo_q_layer1.bias.size() * sizeof(float) +
+                                 wo_q_layer2.weights.size() * sizeof(int8_t) + wo_q_layer2.bias.size() * sizeof(float)) / 1024.0;
+
+        double lut_mem = (double)(q_layer1.packed_weights.size() * sizeof(uint8_t) + q_layer1.bias.size() * sizeof(float) +
+                                  q_layer2.packed_weights.size() * sizeof(uint8_t) + q_layer2.bias.size() * sizeof(float)) / 1024.0;
+
+
+        std::cout << "\n\n--- Memory Cost Comparison ---" << std::endl;
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Model Type          | Memory Cost (KB)   " << std::endl;
+        std::cout << "--------------------|--------------------" << std::endl;
+        std::cout << "Full Prec. Float MLP| " << std::setw(18) << float_mem << std::endl;
+        std::cout << "Wt-Only Quant MLP   | " << std::setw(18) << wo_mem << std::endl;
+        std::cout << "All Quantized (LUT) | " << std::setw(18) << lut_mem << std::endl;
+        std::cout << "------------------------------------------" << std::endl;
+        std::cout << "NOTE: As the size of matrix going larger, the "
+                     "memory cost of LUT table should be negligible."<<std::endl;
+
+
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

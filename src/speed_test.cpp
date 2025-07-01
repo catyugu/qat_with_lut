@@ -170,7 +170,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Number of iterations: " << num_iterations << std::endl;
     std::cout << "Standard Float MLP: " << float_duration.count() << " ms" << std::endl;
     std::cout << "Weights-Only Quantized MLP: " << wo_duration.count() << " ms" << std::endl;
-    std::cout << "LUT-based Quantized MLP: " << lut_duration.count() << " ms" << std::endl;
+    std::cout << "LUT-based Full Quantized MLP: " << lut_duration.count() << " ms" << std::endl;
 
     return 0;
 }
