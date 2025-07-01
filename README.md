@@ -3,13 +3,10 @@
 This report details the optimization efforts for a Multi-Layer Perceptron (MLP) project, focusing on the significant speedup achieved through **AVX2 vectorization** and the use of **Look-up Tables (LUT)**.
 
 -----
-Of course. Here is a more detailed breakdown of the concrete optimization tricks used in this project.
 
 ## Advanced Optimization Techniques
 
 The performance gains in this project are not the result of a single change, but a combination of several advanced optimization techniques working in concert. Let's dive into the specifics of each one.
-
------
 
 ### 1\. Quantization-Aware Training (QAT) and Ternary Representation
 
