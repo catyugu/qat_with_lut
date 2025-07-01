@@ -1,6 +1,81 @@
-# Project Optimization Report: Accelerating MLP Inference
+# Project Optimization Report: Accelerating 1.58-bit quantized MLP Inference
 
 This report details the optimization efforts for a Multi-Layer Perceptron (MLP) project, focusing on the significant speedup achieved through **AVX2 vectorization** and the use of **Look-up Tables (LUT)**.
+
+-----
+Of course. Here is a more detailed breakdown of the concrete optimization tricks used in this project.
+
+## Advanced Optimization Techniques
+
+The performance gains in this project are not the result of a single change, but a combination of several advanced optimization techniques working in concert. Let's dive into the specifics of each one.
+
+-----
+
+### 1\. Quantization-Aware Training (QAT) and Ternary Representation
+
+The foundation of the optimization is **Quantization-Aware Training (QAT)**. Instead of training a full-precision model and then quantizing it (which often leads to a significant accuracy drop), we simulate the quantization effects *during* the training process.
+
+* **Ternary Weights**: During training, the model's weights are clamped to a `[-1, 1]` range and then quantized to one of three values: **-1, 0, or 1**. This is based on a `TERNARY_THRESHOLD` of `0.001`. The `TernaryQuantizeSTE` function in `train_qat_mlp.py` handles this, using a Straight-Through Estimator (STE) to allow gradients to flow during backpropagation despite the non-differentiable quantization step.
+
+* **Learned Activation Scaling**: Activations are also quantized. Instead of a fixed scale, the model *learns* the optimal scale during training. The `QuantizedTernaryActivation` module calculates the running average of the maximum absolute activation values and uses that to determine the scaling factor. This learned scale (`hidden_activation_scale`) is then exported and used in the C++ inference code.
+
+This QAT process produces a model that is already optimized for low-precision arithmetic, minimizing the accuracy loss while preparing it for the next stages of optimization.
+
+-----
+
+### 2\. AVX2 Vectorization: Parallel Processing Power 🚀
+
+Modern CPUs can perform operations on multiple data points simultaneously using **Single Instruction, Multiple Data (SIMD)** instruction sets. This project uses **Advanced Vector Extensions 2 (AVX2)**, which can process 256 bits of data at once.
+
+* **Enabling AVX2**: The `CMakeLists.txt` file explicitly tells the compiler to use AVX2 instructions and apply high-level optimizations (`-O3`).
+
+  ```cmake
+  target_compile_options(myQATModel PRIVATE -mavx2 -O3)
+  ```
+
+* **Intrinsic Functions**: In `src/kernels.cpp`, instead of standard C++ loops, we use **AVX2 intrinsics**. These are special functions that map directly to CPU instructions. For example, in the `weights_only_linear_forward` function, we see intrinsics for loading data (`_mm256_loadu_si256`), performing fused multiply-add operations (`_mm256_madd_epi16`), and adding the results (`_mm256_add_epi32`).
+
+  ```cpp
+  // Example from src/kernels.cpp
+  __m256i mad1 = _mm256_madd_epi16(input_i16_1, weights_i16_1);
+  __m256i mad2 = _mm256_madd_epi16(input_i16_2, weights_i16_2);
+
+  accumulated_sum_vec_32 = _mm256_add_epi32(accumulated_sum_vec_32, _mm256_add_epi32(mad1, mad2));
+  ```
+
+  This allows us to process 32 bytes (or 16 16-bit integers) in a single block of instructions, providing a massive speedup over processing them one by one.
+
+-----
+
+### 3\. Look-up Table (LUT) and Bit-Slice Multiplication ⚡
+
+This is the most innovative optimization in the project. The core idea is to replace expensive arithmetic (multiplication) with cheap memory lookups.
+
+* **The Problem**: A dot product involves many multiplications. Even with quantization, this is computationally intensive.
+
+* **The LUT Solution**: Since our quantized values are only -1, 0, or 1, the result of any multiplication can only be -1, 0, or 1. We can pre-calculate the result of multiplying packed blocks of these ternary values and store them in a **Look-up Table (LUT)**.
+
+* **Building the LUT**: The `build_bit_slice_lut_5x3` function in `src/utils.cpp` creates a large table (`precomputed_lut`). It iterates through every possible combination of a packed 5-value activation and a packed 5-value weight, computes their dot product, and stores the `int32_t` result in the table. The index into the table is cleverly constructed by combining the packed activation and weight bytes.
+
+* **Bit-Slice GEMM**: The `avx2_bit_slice_gemm_kernel` in `src/kernels.cpp` is the key. Instead of multiplying, it:
+
+  1.  Loads packed activation and weight bytes.
+  2.  Uses them to form an index into the `precomputed_lut_ptr`.
+  3.  Uses the AVX2 `_mm256_i32gather_epi32` instruction to fetch 8 pre-computed results from the LUT at once.
+  4.  Accumulates these results to get the final dot product value.
+
+This "bit-slicing" technique completely avoids runtime multiplication for the main GEMM (General Matrix Multiply) operation, replacing it with highly efficient, parallelized memory lookups.
+
+-----
+
+### 4\. Memory Optimization via Value Packing
+
+To make the LUT approach viable and to minimize memory bandwidth usage, we need to pack our data as tightly as possible.
+
+* **From Ternary to 3-bit**: The ternary values (-1, 0, 1) are first encoded into unsigned 3-bit values (0, 1, 2).
+* **5x3 Packing**: Since `3^5 = 243`, which is less than 256, we can pack **five** 3-bit encoded values into a **single byte**. The `pack_five_ternary` function in `src/utils.cpp` implements this by treating the 5 values as digits in a base-3 number system.
+
+This packing scheme reduces the memory footprint of the weights and activations by a factor of **5**, leading to smaller model sizes, less memory usage, and faster data transfer from memory to the CPU.
 
 -----
 
