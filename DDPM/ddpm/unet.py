@@ -3,78 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Quantization-Aware Training Components ---
+from torch.nn.modules.normalization import GroupNorm
 
-# Define the ternary quantization threshold for weights.
-TERNARY_THRESHOLD = 0.001
-
-class TernaryQuantizeSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input_tensor):
-        # Clamp weights to [-1, 1] before quantization
-        clamped_tensor = input_tensor.clamp(-1.0, 1.0)
-        return torch.where(clamped_tensor > TERNARY_THRESHOLD, 1.0,
-                           torch.where(clamped_tensor < -TERNARY_THRESHOLD, -1.0, 0.0))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
-
-class QuantizedConv2d(nn.Conv2d):
-    """
-    A Conv2d layer with ternary quantized weights.
-    """
-    def forward(self, input):
-        # Apply ternary quantization to weights
-        quantized_weight = TernaryQuantizeSTE.apply(self.weight)
-        return F.conv2d(input, quantized_weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
-
-class QuantizedLinear(nn.Linear):
-    """
-    A Linear layer with ternary quantized weights.
-    """
-    def forward(self, input):
-        # Apply ternary quantization to weights
-        quantized_weight = TernaryQuantizeSTE.apply(self.weight)
-        return F.linear(input, quantized_weight, self.bias)
-
-class FakeQuantTernary(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        # Quantize to int8 range, then ternarize
-        x_quant = torch.clamp(torch.round(x / scale), -128, 127)
-
-        # Ternarize based on a small threshold in the quantized space
-        x_ternary = torch.where(x_quant > 1, 1.0, torch.where(x_quant < -1, -1.0, 0.0))
-
-        # Dequantize to simulate the quantization error during forward pass
-        x_dequant = x_ternary * scale
-        return x_dequant
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Pass gradients straight through
-        return grad_output, None
-
-class QuantizedTernaryActivation(nn.Module):
-    def __init__(self, momentum=0.1):
-        super().__init__()
-        self.momentum = momentum
-        # Buffer for the learned maximum absolute value of the activation
-        self.register_buffer('running_abs_max', torch.tensor(1.0))
-
-    def forward(self, x):
-        if self.training:
-            # Update running max with the current batch's max value
-            current_max = torch.max(torch.abs(x.detach()))
-            self.running_abs_max.mul_(1.0 - self.momentum).add_(self.momentum * current_max)
-
-        # Calculate the scale for quantization
-        scale = self.running_abs_max / 127.0
-        return FakeQuantTernary.apply(x, scale)
-
-# --- UNet Components ---
 
 def get_norm(norm, num_channels, num_groups):
     if norm == "in":
@@ -90,6 +20,17 @@ def get_norm(norm, num_channels, num_groups):
 
 
 class PositionalEmbedding(nn.Module):
+    __doc__ = r"""Computes a positional embedding of timesteps.
+
+    Input:
+        x: tensor of shape (N)
+    Output:
+        tensor of shape (N, dim)
+    Args:
+        dim (int): embedding dimension
+        scale (float): linear scale to be applied to timesteps. Default: 1.0
+    """
+
     def __init__(self, dim, scale=1.0):
         super().__init__()
         assert dim % 2 == 0
@@ -107,41 +48,76 @@ class PositionalEmbedding(nn.Module):
 
 
 class Downsample(nn.Module):
+    __doc__ = r"""Downsamples a given tensor by a factor of 2. Uses strided convolution. Assumes even height and width.
+
+    Input:
+        x: tensor of shape (N, in_channels, H, W)
+        time_emb: ignored
+        y: ignored
+    Output:
+        tensor of shape (N, in_channels, H // 2, W // 2)
+    Args:
+        in_channels (int): number of input channels
+    """
+
     def __init__(self, in_channels):
         super().__init__()
-        # Use QuantizedConv2d for downsampling
-        self.downsample = QuantizedConv2d(in_channels, in_channels, 3, stride=2, padding=1)
 
+        self.downsample = nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=1)
+    
     def forward(self, x, time_emb, y):
-        if x.shape[2] % 2 == 1 or x.shape[3] % 2 == 1:
-            raise ValueError("Downsampling tensor height and width should be even")
+        if x.shape[2] % 2 == 1:
+            raise ValueError("downsampling tensor height should be even")
+        if x.shape[3] % 2 == 1:
+            raise ValueError("downsampling tensor width should be even")
+
         return self.downsample(x)
 
 
 class Upsample(nn.Module):
+    __doc__ = r"""Upsamples a given tensor by a factor of 2. Uses resize convolution to avoid checkerboard artifacts.
+
+    Input:
+        x: tensor of shape (N, in_channels, H, W)
+        time_emb: ignored
+        y: ignored
+    Output:
+        tensor of shape (N, in_channels, H * 2, W * 2)
+    Args:
+        in_channels (int): number of input channels
+    """
+
     def __init__(self, in_channels):
         super().__init__()
+
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            # Use QuantizedConv2d for upsampling
-            QuantizedConv2d(in_channels, in_channels, 3, padding=1),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
         )
-
+    
     def forward(self, x, time_emb, y):
         return self.upsample(x)
 
 
 class AttentionBlock(nn.Module):
-    """
-    Attention block remains in full precision as requested.
-    Uses standard nn.Conv2d layers.
+    __doc__ = r"""Applies QKV self-attention with a residual connection.
+    
+    Input:
+        x: tensor of shape (N, in_channels, H, W)
+        norm (string or None): which normalization to use (instance, group, batch, or none). Default: "gn"
+        num_groups (int): number of groups used in group normalization. Default: 32
+    Output:
+        tensor of shape (N, in_channels, H, W)
+    Args:
+        in_channels (int): number of input channels
     """
     def __init__(self, in_channels, norm="gn", num_groups=32):
         super().__init__()
+        
         self.in_channels = in_channels
         self.norm = get_norm(norm, in_channels, num_groups)
-        self.to_qkv = nn.Conv2d(in_channels, in_channels * 3, 1) # Standard Conv
-        self.to_out = nn.Conv2d(in_channels, in_channels, 1)      # Standard Conv
+        self.to_qkv = nn.Conv2d(in_channels, in_channels * 3, 1)
+        self.to_out = nn.Conv2d(in_channels, in_channels, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
@@ -152,14 +128,36 @@ class AttentionBlock(nn.Module):
         v = v.permute(0, 2, 3, 1).view(b, h * w, c)
 
         dot_products = torch.bmm(q, k) * (c ** (-0.5))
+        assert dot_products.shape == (b, h * w, h * w)
+
         attention = torch.softmax(dot_products, dim=-1)
         out = torch.bmm(attention, v)
+        assert out.shape == (b, h * w, c)
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
 
         return self.to_out(out) + x
 
 
 class ResidualBlock(nn.Module):
+    __doc__ = r"""Applies two conv blocks with resudual connection. Adds time and class conditioning by adding bias after first convolution.
+
+    Input:
+        x: tensor of shape (N, in_channels, H, W)
+        time_emb: time embedding tensor of shape (N, time_emb_dim) or None if the block doesn't use time conditioning
+        y: classes tensor of shape (N) or None if the block doesn't use class conditioning
+    Output:
+        tensor of shape (N, out_channels, H, W)
+    Args:
+        in_channels (int): number of input channels
+        out_channels (int): number of output channels
+        time_emb_dim (int or None): time embedding dimension or None if the block doesn't use time conditioning. Default: None
+        num_classes (int or None): number of classes or None if the block doesn't use class conditioning. Default: None
+        activation (function): activation function. Default: torch.nn.functional.relu
+        norm (string or None): which normalization to use (instance, group, batch, or none). Default: "gn"
+        num_groups (int): number of groups used in group normalization. Default: 32
+        use_attention (bool): if True applies AttentionBlock to the output. Default: False
+    """
+
     def __init__(
         self,
         in_channels,
@@ -173,36 +171,37 @@ class ResidualBlock(nn.Module):
         use_attention=False,
     ):
         super().__init__()
+
         self.activation = activation
 
         self.norm_1 = get_norm(norm, in_channels, num_groups)
-        self.conv_1 = QuantizedConv2d(in_channels, out_channels, 3, padding=1)
+        self.conv_1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.norm_2 = get_norm(norm, out_channels, num_groups)
         self.conv_2 = nn.Sequential(
             nn.Dropout(p=dropout),
-            QuantizedConv2d(out_channels, out_channels, 3, padding=1),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
         )
 
-        # Use QuantizedLinear for time embedding projection
-        self.time_bias = QuantizedLinear(time_emb_dim, out_channels) if time_emb_dim is not None else None
+        self.time_bias = nn.Linear(time_emb_dim, out_channels) if time_emb_dim is not None else None
         self.class_bias = nn.Embedding(num_classes, out_channels) if num_classes is not None else None
 
-        self.residual_connection = QuantizedConv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.residual_connection = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
         self.attention = nn.Identity() if not use_attention else AttentionBlock(out_channels, norm, num_groups)
-
+    
     def forward(self, x, time_emb=None, y=None):
         out = self.activation(self.norm_1(x))
         out = self.conv_1(out)
 
         if self.time_bias is not None:
             if time_emb is None:
-                raise ValueError("Time conditioning was specified but time_emb is not passed")
+                raise ValueError("time conditioning was specified but time_emb is not passed")
             out += self.time_bias(self.activation(time_emb))[:, :, None, None]
 
         if self.class_bias is not None:
             if y is None:
-                raise ValueError("Class conditioning was specified but y is not passed")
+                raise ValueError("class conditioning was specified but y is not passed")
+
             out += self.class_bias(y)[:, :, None, None]
 
         out = self.activation(self.norm_2(out))
@@ -211,9 +210,31 @@ class ResidualBlock(nn.Module):
 
         return out
 
-# --- QAT_UNet ---
 
-class QAT_UNet(nn.Module):
+class UNet(nn.Module):
+    __doc__ = """UNet model used to estimate noise.
+
+    Input:
+        x: tensor of shape (N, in_channels, H, W)
+        time_emb: time embedding tensor of shape (N, time_emb_dim) or None if the block doesn't use time conditioning
+        y: classes tensor of shape (N) or None if the block doesn't use class conditioning
+    Output:
+        tensor of shape (N, out_channels, H, W)
+    Args:
+        img_channels (int): number of image channels
+        base_channels (int): number of base channels (after first convolution)
+        channel_mults (tuple): tuple of channel multiplers. Default: (1, 2, 4, 8)
+        time_emb_dim (int or None): time embedding dimension or None if the block doesn't use time conditioning. Default: None
+        time_emb_scale (float): linear scale to be applied to timesteps. Default: 1.0
+        num_classes (int or None): number of classes or None if the block doesn't use class conditioning. Default: None
+        activation (function): activation function. Default: torch.nn.functional.relu
+        dropout (float): dropout rate at the end of each residual block
+        attention_resolutions (tuple): list of relative resolutions at which to apply attention. Default: ()
+        norm (string or None): which normalization to use (instance, group, batch, or none). Default: "gn"
+        num_groups (int): number of groups used in group normalization. Default: 32
+        initial_pad (int): initial padding applied to image. Should be used if height or width is not a power of 2. Default: 0
+    """
+
     def __init__(
         self,
         img_channels,
@@ -231,27 +252,29 @@ class QAT_UNet(nn.Module):
         initial_pad=0,
     ):
         super().__init__()
+
         self.activation = activation
         self.initial_pad = initial_pad
-        self.num_classes = num_classes
 
-        # Use QuantizedLinear for time embedding MLP
+        self.num_classes = num_classes
         self.time_mlp = nn.Sequential(
             PositionalEmbedding(base_channels, time_emb_scale),
-            QuantizedLinear(base_channels, time_emb_dim),
+            nn.Linear(base_channels, time_emb_dim),
             nn.SiLU(),
-            QuantizedLinear(time_emb_dim, time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
         ) if time_emb_dim is not None else None
-
-        self.init_conv = QuantizedConv2d(img_channels, base_channels, 3, padding=1)
+    
+        self.init_conv = nn.Conv2d(img_channels, base_channels, 3, padding=1)
 
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
+
         channels = [base_channels]
         now_channels = base_channels
 
         for i, mult in enumerate(channel_mults):
             out_channels = base_channels * mult
+
             for _ in range(num_res_blocks):
                 self.downs.append(ResidualBlock(
                     now_channels,
@@ -270,6 +293,7 @@ class QAT_UNet(nn.Module):
             if i != len(channel_mults) - 1:
                 self.downs.append(Downsample(now_channels))
                 channels.append(now_channels)
+        
 
         self.mid = nn.ModuleList([
             ResidualBlock(
@@ -281,7 +305,7 @@ class QAT_UNet(nn.Module):
                 activation=activation,
                 norm=norm,
                 num_groups=num_groups,
-                use_attention=True, # This will use the full-precision AttentionBlock
+                use_attention=True,
             ),
             ResidualBlock(
                 now_channels,
@@ -298,6 +322,7 @@ class QAT_UNet(nn.Module):
 
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_channels = base_channels * mult
+
             for _ in range(num_res_blocks + 1):
                 self.ups.append(ResidualBlock(
                     channels.pop() + now_channels,
@@ -308,16 +333,18 @@ class QAT_UNet(nn.Module):
                     activation=activation,
                     norm=norm,
                     num_groups=num_groups,
-                    use_attention=i in attention_resolutions, # This will use the full-precision AttentionBlock
+                    use_attention=i in attention_resolutions,
                 ))
                 now_channels = out_channels
             
             if i != 0:
                 self.ups.append(Upsample(now_channels))
-
+        
+        assert len(channels) == 0
+        
         self.out_norm = get_norm(norm, base_channels, num_groups)
-        self.out_conv = QuantizedConv2d(base_channels, img_channels, 3, padding=1)
-
+        self.out_conv = nn.Conv2d(base_channels, img_channels, 3, padding=1)
+    
     def forward(self, x, time=None, y=None):
         ip = self.initial_pad
         if ip != 0:
@@ -325,15 +352,17 @@ class QAT_UNet(nn.Module):
 
         if self.time_mlp is not None:
             if time is None:
-                raise ValueError("Time conditioning was specified but time is not passed")
+                raise ValueError("time conditioning was specified but tim is not passed")
+            
             time_emb = self.time_mlp(time)
         else:
             time_emb = None
         
         if self.num_classes is not None and y is None:
-            raise ValueError("Class conditioning was specified but y is not passed")
+            raise ValueError("class conditioning was specified but y is not passed")
         
         x = self.init_conv(x)
+
         skips = [x]
 
         for layer in self.downs:
