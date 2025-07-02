@@ -2,7 +2,7 @@ import argparse
 import torchvision
 import torch.nn.functional as F
 import torch
-from .unet import UNet
+from .unet import UNet # Assuming this now points to QAT_UNet or UNet is replaced
 from PIL import Image
 from .diffusion import (
     GaussianDiffusion,
@@ -70,7 +70,7 @@ def diffusion_defaults():
         time_emb_dim=128 * 4,
         norm="gn",
         dropout=0.1,
-        activation="silu",
+        activation="silu", # This default is kept for consistency but will not be used by QAT_UNet
         attention_resolutions=(1,),
 
         ema_decay=0.9999,
@@ -81,11 +81,10 @@ def diffusion_defaults():
 
 
 def get_diffusion_from_args(args):
-    activations = {
-        "relu": F.relu,
-        "mish": F.mish,
-        "silu": F.silu,
-    }
+    # The 'activations' dictionary and 'args.activation' are no longer used
+    # directly by UNet (QAT_UNet) since QAT_UNet handles activations internally.
+    # We still need to ensure that the UNet import points to your QAT_UNet.py
+    # either by renaming QAT_UNet.py to unet.py or by changing the import.
 
     model = UNet(
         img_channels=3,
@@ -95,7 +94,7 @@ def get_diffusion_from_args(args):
         time_emb_dim=args.time_emb_dim,
         norm=args.norm,
         dropout=args.dropout,
-        activation=activations[args.activation],
+        # Removed: activation=activations[args.activation],
         attention_resolutions=args.attention_resolutions,
 
         num_classes=None if not args.use_labels else 10,
