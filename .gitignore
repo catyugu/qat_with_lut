@@ -4,3 +4,8 @@ datasets/
 .idea/
 *.pth
 *.bin
+DDPM/cifar_test
+DDPM/cifar_train
+DDPM/.gitignore
+DDPM/.README.md
+DDPM/samples
