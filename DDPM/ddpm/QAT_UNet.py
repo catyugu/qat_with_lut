@@ -1,5 +1,3 @@
-# In DDPM/ddpm/QAT_UNet.py
-
 import math
 import torch
 import torch.nn as nn
@@ -7,7 +5,7 @@ import torch.nn.functional as F
 
 # --- Quantization-Aware Training Components ---
 
-TERNARY_THRESHOLD = 0.001
+TERNARY_THRESHOLD = 1e-12
 
 class TernaryWeightQuantizer(torch.autograd.Function):
     @staticmethod
@@ -21,6 +19,7 @@ class TernaryWeightQuantizer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         # Pass the gradient straight-through to the full-precision weights
+        
         return grad_output
 
 class QuantizedConv2d(nn.Conv2d):
@@ -62,11 +61,22 @@ class FakeQuantTernary(torch.autograd.Function):
         return grad_x, grad_scale
 
 class QuantizedTernaryActivation(nn.Module):
+    """
+    A learnable ternary activation layer with a switch to enable/disable quantization.
+    """
     def __init__(self):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(1.0))
+        # This flag allows enabling/disabling quantization from the training script
+        self.quantize = True
+
     def forward(self, x):
-        return FakeQuantTernary.apply(x, self.scale)
+        if self.quantize:
+            # Apply quantization only if the flag is True
+            return FakeQuantTernary.apply(x, self.scale)
+        else:
+            # Otherwise, act as an identity function (pass-through)
+            return x
 
 
 # --- The rest of the UNet/ResidualBlock code remains the same ---

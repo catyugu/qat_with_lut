@@ -139,8 +139,8 @@ def create_argparser():
         iterations=5000,
 
         log_to_wandb=False,
-        log_rate=500,
-        checkpoint_rate=500,
+        log_rate=1000,
+        checkpoint_rate=1000,
         log_dir="ddpm_logs",
         run_name=run_name,
 
