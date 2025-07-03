@@ -63,11 +63,23 @@ extern std::vector<uint8_t> g_packing_lut;
 // --- 激活函数 ---
 void relu(float* vec_ptr, size_t size);
 void log_softmax(float* vec_ptr, size_t size);
+void silu(float* vec_ptr, size_t size); // Added SiLU declaration
+
+// --- Data Transformation Functions ---
+// Declaration for im2col function
+void im2col(const float* data_im, int channels, int height, int width,
+            int ksize_h, int ksize_w, int stride_h, int stride_w, int pad_h, int pad_w,
+            std::vector<float>& data_col);
 
 // --- 数据加载函数 ---
 bool load_images_from_file(const std::string& path, std::vector<float>& images, int num_images, int image_size);
 bool load_labels_from_file(const std::string& path, std::vector<int>& labels, int num_labels);
 bool load_full_precision_mlp(const std::string& path, FloatLayer& layer1, FloatLayer& layer2, int input_dim_padded, int hidden_dim, int output_dim);
+
+// --- Image Saving Function ---
+// Saves a float array (NCHW format, values in [-1, 1]) as a PNG image.
+bool save_image_from_float_array(const std::string& filename, const std::vector<float>& image_data,
+                                 int channels, int height, int width);
 
 // --- 其他通用工具函数 ---
 int argmax(const std::vector<float>& vec, int offset, int size);

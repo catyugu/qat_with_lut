@@ -40,8 +40,15 @@ add_executable(speed_test
         src/utils.cpp
         src/kernels.cpp
 )
-
+add_executable(generate_image 
+        src/generate_image.cpp
+        src/qat_unet_model.cpp
+        src/kernels.cpp 
+        src/types.cpp
+        src/utils.cpp
+        )
 target_include_directories(speed_test PUBLIC include)
+target_include_directories(generate_image PUBLIC include)
 
 target_link_libraries(speed_test PRIVATE
         Threads::Threads
@@ -52,11 +59,9 @@ target_link_libraries(speed_test PRIVATE
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(myQATModel PRIVATE -mavx2 -O3 )
     target_compile_options(speed_test PRIVATE -mavx2 -O3)
-elseif(MSVC)
-    #
-#    target_compile_options(myQATModel PRIVATE /arch:AVX512)
+    target_compile_options(generate_image PRIVATE -mavx2 -O3 )
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
     target_compile_options(myQATModel PRIVATE /arch:AVX2)
     target_compile_options(speed_test PRIVATE /arch:AVX2)
+    target_compile_options(generate_image PRIVATE /arch:AVX2)
 endif()
-
-message(STATUS "Project configured successfully. This is the final version.")

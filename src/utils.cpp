@@ -6,6 +6,10 @@
 #include <iostream>  // For std::cerr, std::cout (for debugging/errors in loading)
 #include <fstream>   // For std::ifstream
 
+// Include for image writing (define STB_IMAGE_WRITE_IMPLEMENTATION once in one .cpp file)
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #ifdef __AVX512F__
 #include <immintrin.h> // For AVX512 intrinsics
 #endif
@@ -22,14 +26,14 @@ uint8_t encode_ternary_to_3bit_val(int8_t val) {
     if (val == -1) return 0;
     if (val == 0)  return 1;
     if (val == 1)  return 2;
-    return 1;
+    return 1; // Default to 0 for unexpected values
 }
 
 int8_t decode_3bit_val_to_ternary(uint8_t encoded_val) {
     if (encoded_val == 0) return -1;
     if (encoded_val == 1) return 0;
     if (encoded_val == 2) return 1;
-    return 0;
+    return 0; // Default to 0 for unexpected values
 }
 
 uint8_t pack_five_ternary(const uint8_t t_encoded_values[5]) {
@@ -93,7 +97,7 @@ void encode_int8_to_3bit_simd(const int8_t* input, uint8_t* output, size_t size)
     // Target encoded values
     const __m256i encoded_zero = _mm256_set1_epi8(0);   // Target for -1
     const __m256i encoded_one = _mm256_set1_epi8(1);    // Target for 0
-    const __m256i encoded_two = _mm256_set1_epi8(2);    // Target for 1
+    const __m256i encoded_two = _mm256_set1_epi8(2);     // Target for 1
 
     size_t i = 0;
     for (; i + 31 < size; i += 32) {
@@ -305,6 +309,50 @@ void log_softmax(float* vec_ptr, size_t size) {
     float log_sum = std::log(sum);
     for (size_t i = 0; i < size; ++i) vec_ptr[i] = (vec_ptr[i] - max_val) - log_sum;
 }
+// SiLU is now defined here.
+void silu(float* vec_ptr, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        vec_ptr[i] = vec_ptr[i] * (1.0f / (1.0f + std::exp(-vec_ptr[i])));
+    }
+}
+
+
+// --- Data Transformation Functions Implementation ---
+void im2col(const float* data_im, int channels, int height, int width,
+            int kernel_h, int kernel_w, int stride_h, int stride_w,
+            int pad_h, int pad_w, std::vector<float>& col) {
+
+    int output_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int output_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
+    int col_rows = channels * kernel_h * kernel_w;
+    int col_cols = output_h * output_w;
+
+    col.assign(col_rows * col_cols, 0.0f); // Resize and initialize with zeros
+
+    for (int c = 0; c < channels; ++c) {
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int input_row_start = -pad_h + kh;
+                for (int oh = 0; oh < output_h; ++oh) {
+                    int input_col_start = -pad_w + kw;
+                    for (int ow = 0; ow < output_w; ++ow) {
+                        int col_index = (c * kernel_h * kernel_w + kh * kernel_w + kw) * (output_h * output_w) + oh * output_w + ow;
+                        int input_h_idx = input_row_start + oh * stride_h;
+                        int input_w_idx = input_col_start + ow * stride_w;
+
+                        if (input_h_idx >= 0 && input_h_idx < height && input_w_idx >= 0 && input_w_idx < width) {
+                            // Convert NCHW to NHWC for input indexing if needed, but here it's flat NCHW
+                            col[col_index] = data_im[c * height * width + input_h_idx * width + input_w_idx];
+                        } else {
+                            col[col_index] = 0; // Padding (already initialized to 0, but explicit for clarity)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 // --- 数据加载函数实现 ---
 bool load_images_from_file(const std::string& path, std::vector<float>& images, int num_images, int image_size) {
@@ -375,8 +423,50 @@ bool load_full_precision_mlp(const std::string& path, FloatLayer& layer1, FloatL
     return file.good();
 }
 
+// --- Image Saving Function Implementation ---
+// Saves a float array (NCHW format, values in [-1, 1]) as a PNG image.
+bool save_image_from_float_array(const std::string& filename, const std::vector<float>& image_data,
+                                 int channels, int height, int width) {
+    if (image_data.empty() || channels <= 0 || height <= 0 || width <= 0) {
+        std::cerr << "Error: Invalid image data for saving." << std::endl;
+        return false;
+    }
+
+    // Convert float image data [-1, 1] to uint8_t [0, 255]
+    // The input image_data is assumed to be in NCHW format (C, H, W for a single image)
+    // stb_image_write expects HWC (Height, Width, Channels) format.
+    std::vector<unsigned char> reordered_pixel_data(height * width * channels);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < channels; ++c) {
+                // Calculate original NCHW index
+                size_t original_idx = c * (height * width) + y * width + x;
+                // Calculate new HWC index
+                size_t new_idx = y * (width * channels) + x * channels + c;
+
+                // Scale from [-1, 1] to [0, 1] then to [0, 255]
+                float val_0_1 = (image_data[original_idx] + 1.0f) / 2.0f;
+                reordered_pixel_data[new_idx] = static_cast<unsigned char>(std::round(val_0_1 * 255.0f));
+            }
+        }
+    }
+    
+    // For 3-channel images (RGB), stb_image_write_png works directly.
+    // For 1-channel images (grayscale), stb_image_write_png also works.
+    int stride_bytes = width * channels; // bytes per row
+
+    if (stbi_write_png(filename.c_str(), width, height, channels, reordered_pixel_data.data(), stride_bytes)) {
+        return true;
+    } else {
+        std::cerr << "Error: Failed to write PNG image to " << filename << std::endl;
+        return false;
+    }
+}
+
+
 // --- 其他通用工具函数实现 ---
 int argmax(const std::vector<float>& vec, int offset, int size) {
     if (size == 0) return -1;
     return static_cast<int>(std::distance(vec.begin() + offset, std::max_element(vec.begin() + offset, vec.begin() + offset + size)));
 }
+

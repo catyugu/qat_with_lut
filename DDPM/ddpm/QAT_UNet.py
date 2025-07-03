@@ -17,7 +17,7 @@ class ScaledWeightTernary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight):
         alpha = torch.mean(torch.abs(weight)).detach()
-        threshold = 0.05 * alpha
+        threshold = 0.001 * alpha
         quantized_weight = torch.where(weight > threshold, 1.0, 
                                        torch.where(weight < -threshold, -1.0, 0.0))
         scaled_quantized_weight = alpha * quantized_weight

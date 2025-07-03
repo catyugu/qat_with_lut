@@ -17,7 +17,7 @@ from ddpm.diffusion import GaussianDiffusion, generate_linear_schedule
 from ddpm.script_utils_qat import get_transform, cycle
 
 def main():
-    parser = argparse.ArgumentParser(description="Robust QAT Training from Scratch with Progressive Quantization")
+    parser = argparse.ArgumentParser(description="Robust QAT Training Script")
     
     # Paths
     parser.add_argument("--dataset_path", type=str, default="./data", help="Path to CIFAR-10 dataset")
@@ -25,9 +25,7 @@ def main():
     parser.add_argument("--sample_dir", type=str, default="./samples", help="Directory to save generated samples")
     # Training Hyperparameters
     parser.add_argument("--device", type=str, default="cuda:2" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--total_train_steps", type=int, default=60000, help="Total steps for all three phases.")
-    parser.add_argument("--phase1_steps", type=int, default=2000, help="Phase 1: Full-precision training.")
-    parser.add_argument("--phase2_steps", type=int, default=2000, help="Phase 2: Weights-only quantization.")
+    parser.add_argument("--total_train_steps", type=int, default=60000, help="Total steps.")
     parser.add_argument("--sample_interval", type=int, default=1000, help="Frequency of saving sample images.")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
@@ -65,11 +63,9 @@ def main():
         norm=args.norm, num_groups=32, initial_pad=0,
     ).to(args.device)
 
-    # --- PROGRESSIVE QUANTIZATION SETUP ---
-    model.set_quantize_weights(False)
-    model.set_quantize_activations(False)
-    print(f"Phase 1: Training in full-precision for {args.phase1_steps} steps.")
-    
+    # --- SETUP ---
+    model.set_quantize_weights(True)
+    model.set_quantize_activations(True)
     betas = generate_linear_schedule(args.num_timesteps, low=1e-4, high=0.02)
     diffusion = GaussianDiffusion(model, (32, 32), 3, betas=betas, loss_type="l2",num_classes=10).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -79,18 +75,6 @@ def main():
     data_iter = cycle(dataloader)
     
     for i in pbar:
-        # --- Check for phase transitions ---
-        if i == args.phase1_steps:
-            model.set_quantize_weights(True)
-            print("\n" + "*"*40)
-            print(f"Step {i}: Phase 1 complete. Enabling WEIGHT quantization.")
-            print("*"*40)
-        
-        if i == (args.phase1_steps + args.phase2_steps):
-            model.set_quantize_activations(True)
-            print("\n" + "*"*40)
-            print(f"Step {i}: Phase 2 complete. Enabling ACTIVATION quantization.")
-            print("*"*40)
 
         optimizer.zero_grad()
         x, y = next(data_iter)
