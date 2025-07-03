@@ -40,8 +40,8 @@ def main():
     parser.add_argument("--qat_model_path", type=str, default="./qat_unet_progressive.pth", help="Path to the pre-trained QAT UNet model.")
     
     # Training Hyperparameters
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--train_steps", type=int, default=10000)
+    parser.add_argument("--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--train_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     
