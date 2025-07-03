@@ -1,165 +1,129 @@
-import argparse
-import datetime
+# DDPM/train_qat_progressive.py
+# Final robust training script using Progressive Quantization.
+
+import os
 import torch
-import wandb
-
+import argparse
+import torchvision
+from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torchvision import datasets
-from ddpm import script_utils_qat
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torchvision.utils as tv_utils
+from PIL import Image
 
+# Import the necessary components from your project structure
+from ddpm.QAT_UNet import QATUNet
+from ddpm.diffusion import GaussianDiffusion, generate_linear_schedule
+from ddpm.script_utils_qat import get_transform, cycle
 
 def main():
-    args = create_argparser().parse_args()
-    device = args.device
+    parser = argparse.ArgumentParser(description="Robust QAT Training from Scratch with Progressive Quantization")
+    
+    # Paths
+    parser.add_argument("--dataset_path", type=str, default="./data", help="Path to CIFAR-10 dataset")
+    parser.add_argument("--save_path", type=str, default="./qat_unet_progressive.pth", help="Path to save the trained model")
+    parser.add_argument("--sample_dir", type=str, default="./samples", help="Directory to save generated samples")
+    # Training Hyperparameters
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--total_train_steps", type=int, default=60000, help="Total steps for all three phases.")
+    parser.add_argument("--phase1_steps", type=int, default=2000, help="Phase 1: Full-precision training.")
+    parser.add_argument("--phase2_steps", type=int, default=2000, help="Phase 2: Weights-only quantization.")
+    parser.add_argument("--sample_interval", type=int, default=1000, help="Frequency of saving sample images.")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    
+    # Diffusion Hyperparameters
+    parser.add_argument("--num_timesteps", type=int, default=1000)
 
-    try:
-        diffusion = script_utils_qat.get_diffusion_from_args(args).to(device)
-        optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.learning_rate)
+    # UNet Hyperparameters
+    parser.add_argument("--base_channels", type=int, default=128)
+    parser.add_argument("--channel_mults", type=str, default="1,2,2,2")
+    parser.add_argument("--num_res_blocks", type=int, default=2)
+    parser.add_argument("--time_emb_dim", type=int, default=512)
+    parser.add_argument("--norm", type=str, default="gn")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--attention_resolutions", type=str, default="1", help="Resolutions for attention blocks")
+    
+    args = parser.parse_args()
+    
+    args.channel_mults = tuple(map(int, args.channel_mults.split(',')))
+    args.attention_resolutions = tuple(map(int, args.attention_resolutions.split(',')))
 
-        if args.model_checkpoint is not None:
-            diffusion.load_state_dict(torch.load(args.model_checkpoint))
-        if args.optim_checkpoint is not None:
-            optimizer.load_state_dict(torch.load(args.optim_checkpoint))
+    print("="*40)
+    print("Starting Progressive Quantization Training")
+    print("="*40)
 
-        if args.log_to_wandb:
-            if args.project_name is None:
-                raise ValueError("args.log_to_wandb set to True but args.project_name is None")
-
-            run = wandb.init(
-                project=args.project_name,
-                entity='treaptofun',
-                config=vars(args),
-                name=args.run_name,
-            )
-            wandb.watch(diffusion)
-
-        batch_size = args.batch_size
-
-        train_dataset = datasets.CIFAR10(
-            root='./cifar_train',
-            train=True,
-            download=True,
-            transform=script_utils_qat.get_transform(),
-        )
-
-        test_dataset = datasets.CIFAR10(
-            root='./cifar_test',
-            train=False,
-            download=True,
-            transform=script_utils_qat.get_transform(),
-        )
-
-        train_loader = script_utils_qat.cycle(DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=2,
-        ))
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, num_workers=2)
-        
-        acc_train_loss = 0
-
-        for iteration in range(1, args.iterations + 1):
-            diffusion.train()
-
-            x, y = next(train_loader)
-            x = x.to(device)
-            y = y.to(device)
-
-            if args.use_labels:
-                loss = diffusion(x, y)
-            else:
-                loss = diffusion(x)
-
-            acc_train_loss += loss.item()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            diffusion.update_ema()
-            
-            if iteration % args.log_rate == 0:
-                test_loss = 0
-                with torch.no_grad():
-                    diffusion.eval()
-                    for x, y in test_loader:
-                        x = x.to(device)
-                        y = y.to(device)
-
-                        if args.use_labels:
-                            loss = diffusion(x, y)
-                        else:
-                            loss = diffusion(x)
-
-                        test_loss += loss.item()
-                
-                if args.use_labels:
-                    samples = diffusion.sample(10, device, y=torch.arange(10, device=device))
-                else:
-                    samples = diffusion.sample(10, device)
-                
-                samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).numpy()
-
-                test_loss /= len(test_loader)
-                acc_train_loss /= args.log_rate
-
-                print(f"test_loss: {test_loss:.4f}, train_loss: {acc_train_loss:.4f}, iteration: {iteration}")
-                
-                ##save samples
-                import os
-                os.makedirs('samples', exist_ok=True)
-                for i, sample in enumerate(samples):
-                    script_utils_qat.save_image(sample, f"samples/{args.project_name}-{args.run_name}-iteration-{iteration}-sample-{i}.png")
-
-                acc_train_loss = 0
-            
-            if iteration % args.checkpoint_rate == 0:
-                model_filename = f"{args.log_dir}/{args.project_name}-{args.run_name}-iteration-{iteration}-model.pth"
-                optim_filename = f"{args.log_dir}/{args.project_name}-{args.run_name}-iteration-{iteration}-optim.pth"
-
-                torch.save(diffusion.state_dict(), model_filename)
-                torch.save(optimizer.state_dict(), optim_filename)
-        
-        if args.log_to_wandb:
-            run.finish()
-    except KeyboardInterrupt:
-        if args.log_to_wandb:
-            run.finish()
-        print("Keyboard interrupt, run finished early")
-
-
-def create_argparser():
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    run_name = datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M")
-    defaults = dict(
-        learning_rate=2e-4,
-        batch_size=128,
-        iterations=5000,
-
-        log_to_wandb=False,
-        log_rate=1000,
-        checkpoint_rate=1000,
-        log_dir="ddpm_logs",
-        run_name=run_name,
-
-        model_checkpoint=None,
-        optim_checkpoint=None,
-
-        schedule_low=1e-4,
-        schedule_high=0.02,
-        
-        project_name="ddpm-cifar10",
-
-        device=device,
+    dataset = torchvision.datasets.CIFAR10(
+        root=args.dataset_path, train=True, download=True, transform=get_transform()
     )
-    defaults.update(script_utils_qat.diffusion_defaults())
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    
+    model = QATUNet(
+        img_channels=3, base_channels=args.base_channels, channel_mults=args.channel_mults,
+        num_res_blocks=args.num_res_blocks, time_emb_dim=args.time_emb_dim, time_emb_scale=1.0,
+        num_classes=None, dropout=args.dropout, attention_resolutions=args.attention_resolutions,
+        norm=args.norm, num_groups=32, initial_pad=0,
+    ).to(args.device)
 
-    parser = argparse.ArgumentParser()
-    script_utils_qat.add_dict_to_argparser(parser, defaults)
-    return parser
+    # --- PROGRESSIVE QUANTIZATION SETUP ---
+    model.set_quantize_weights(False)
+    model.set_quantize_activations(False)
+    print(f"Phase 1: Training in full-precision for {args.phase1_steps} steps.")
+    
+    betas = generate_linear_schedule(args.num_timesteps, low=1e-4, high=0.02)
+    diffusion = GaussianDiffusion(model, (32, 32), 3, betas=betas, loss_type="l2",num_classes=10).to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.total_train_steps)
 
+    pbar = tqdm(range(args.total_train_steps))
+    data_iter = cycle(dataloader)
+    
+    for i in pbar:
+        # --- Check for phase transitions ---
+        if i == args.phase1_steps:
+            model.set_quantize_weights(True)
+            print("\n" + "*"*40)
+            print(f"Step {i}: Phase 1 complete. Enabling WEIGHT quantization.")
+            print("*"*40)
+        
+        if i == (args.phase1_steps + args.phase2_steps):
+            model.set_quantize_activations(True)
+            print("\n" + "*"*40)
+            print(f"Step {i}: Phase 2 complete. Enabling ACTIVATION quantization.")
+            print("*"*40)
+
+        optimizer.zero_grad()
+        x, y = next(data_iter)
+        x = x.to(args.device)
+        y = y.to(args.device)
+        
+        loss = diffusion(x,y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        diffusion.update_ema()
+        pbar.set_description(f"Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.1e}")
+        if (i + 1) % args.sample_interval == 0:
+            model.eval() # Set model to evaluation mode
+            with torch.no_grad():
+                labels_to_sample = torch.arange(10, device=args.device)
+                samples = diffusion.sample(batch_size=10, device=args.device, y=labels_to_sample, use_ema=True)
+                tv_utils.save_image(
+                    samples,
+                    os.path.join(args.sample_dir, f"sample_step_{i+1}.png"),
+                    nrow=10,
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+            model.train() # Set model back to training mode
+        if (i + 1) % 1000 == 0:
+            torch.save(model.state_dict(), args.save_path)
+            print(f"\nSaved model checkpoint at step {i+1} to {args.save_path}")
+
+    print("Training complete.")
+    torch.save(model.state_dict(), args.save_path)
+    print(f"Final model saved to {args.save_path}")
 
 if __name__ == "__main__":
     main()

@@ -36,14 +36,14 @@ def main():
         batch_size = args.batch_size
 
         train_dataset = datasets.CIFAR10(
-            root='./cifar_train',
+            root='./data',
             train=True,
             download=True,
             transform=script_utils.get_transform(),
         )
 
         test_dataset = datasets.CIFAR10(
-            root='./cifar_test',
+            root='./data',
             train=False,
             download=True,
             transform=script_utils.get_transform(),

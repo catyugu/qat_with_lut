@@ -1,93 +1,77 @@
+# DDPM/ddpm/QAT_UNet.py
+# Final version with a robust, scaled activation quantizer for stable training.
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Quantization-Aware Training Components ---
+# =================================================================================
+# 1. Ternary Quantization Components
+# =================================================================================
 
-TERNARY_THRESHOLD = 1e-12
-
-class TernaryWeightQuantizer(torch.autograd.Function):
+class ScaledWeightTernary(torch.autograd.Function):
+    """
+    A robust ternary weight quantizer that uses a layer-wise scaling factor.
+    """
     @staticmethod
-    def forward(ctx, full_precision_weight):
-        # Clamp weights to a learnable range, then ternarize
-        w_clamped = full_precision_weight.clamp(-1.0, 1.0)
-        # Ternarize based on a small threshold
-        return torch.where(w_clamped > TERNARY_THRESHOLD, 1.0,
-                           torch.where(w_clamped < -TERNARY_THRESHOLD, -1.0, 0.0))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Pass the gradient straight-through to the full-precision weights
-        
-        return grad_output
-
-class QuantizedConv2d(nn.Conv2d):
-    """
-    A Conv2d layer with stably quantized ternary weights.
-    """
-    def forward(self, input):
-        # Apply stable ternary quantization to weights
-        quantized_weight = TernaryWeightQuantizer.apply(self.weight)
-        return F.conv2d(input, quantized_weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
-
-class QuantizedLinear(nn.Linear):
-    """
-    A Linear layer with stably quantized ternary weights.
-    """
-    def forward(self, input):
-        # Apply stable ternary quantization to weights
-        quantized_weight = TernaryWeightQuantizer.apply(self.weight)
-        return F.linear(input, quantized_weight, self.bias)
-
-
-# This activation quantization logic is confirmed to be working correctly.
-class FakeQuantTernary(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        scale = torch.abs(scale)
-        x_dequant = (x / scale).round().clamp(-1, 1) * scale
-        ctx.save_for_backward(x, scale)
-        return x_dequant
+    def forward(ctx, weight):
+        alpha = torch.mean(torch.abs(weight)).detach()
+        threshold = 0.05 * alpha
+        quantized_weight = torch.where(weight > threshold, 1.0, 
+                                       torch.where(weight < -threshold, -1.0, 0.0))
+        scaled_quantized_weight = alpha * quantized_weight
+        ctx.save_for_backward(weight)
+        return scaled_quantized_weight
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, scale = ctx.saved_tensors
-        is_in_range = (x.abs() <= scale).float()
-        grad_x = grad_output * is_in_range
-        dequantized_x = (x / scale).round().clamp(-1, 1)
-        grad_scale = (grad_output * (dequantized_x - x / scale) * is_in_range).sum()
-        return grad_x, grad_scale
+        weight, = ctx.saved_tensors
+        grad_weight = grad_output.clone()
+        grad_weight[weight.abs() > 1.0] = 0 
+        return grad_weight
 
-class QuantizedTernaryActivation(nn.Module):
+class ScaledActivationTernary(torch.autograd.Function):
     """
-    A learnable ternary activation layer with a switch to enable/disable quantization.
+    A robust ternary activation quantizer that calculates a scaling factor
+    on-the-fly from the input tensor, similar to the weight quantizer.
     """
-    def __init__(self):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(1.0))
-        # This flag allows enabling/disabling quantization from the training script
-        self.quantize = True
+    @staticmethod
+    def forward(ctx, x):
+        alpha = torch.mean(torch.abs(x)).detach()
+        threshold = 0.05 * alpha
+        quantized_x = torch.where(x > threshold, 1.0, 
+                                  torch.where(x < -threshold, -1.0, 0.0))
+        scaled_quantized_x = alpha * quantized_x
+        ctx.save_for_backward(x)
+        return scaled_quantized_x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_tensors
+        grad_x = grad_output.clone()
+        grad_x[x.abs() > 1.0] = 0
+        return grad_x
+
+class QATConv2d(nn.Conv2d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.quantize_weights = True
 
     def forward(self, x):
-        if self.quantize:
-            # Apply quantization only if the flag is True
-            return FakeQuantTernary.apply(x, self.scale)
+        if self.quantize_weights and self.training:
+            quantized_weight = ScaledWeightTernary.apply(self.weight)
+            return F.conv2d(x, quantized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
         else:
-            # Otherwise, act as an identity function (pass-through)
-            return x
+            return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
-
-# --- The rest of the UNet/ResidualBlock code remains the same ---
-# It will now use the final, stable versions of all quantization modules.
+# =================================================================================
+# 2. Robust UNet Structure
+# =================================================================================
 
 def get_norm(norm, num_channels, num_groups):
-    if norm == "in": return nn.InstanceNorm2d(num_channels, affine=True)
-    elif norm == "bn": return nn.BatchNorm2d(num_channels)
-    elif norm == "gn": return nn.GroupNorm(num_groups, num_channels)
-    elif norm is None: return nn.Identity()
-    else: raise ValueError("unknown normalization type")
+    if norm == "gn": return nn.GroupNorm(num_groups, num_channels)
+    else: return nn.Identity()
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, dim, scale=1.0):
@@ -95,6 +79,7 @@ class PositionalEmbedding(nn.Module):
         assert dim % 2 == 0
         self.dim = dim
         self.scale = scale
+
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
@@ -107,7 +92,8 @@ class PositionalEmbedding(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        self.downsample = QuantizedConv2d(in_channels, in_channels, 3, stride=2, padding=1)
+        self.downsample = QATConv2d(in_channels, in_channels, 3, stride=2, padding=1)
+
     def forward(self, x, time_emb, y):
         return self.downsample(x)
 
@@ -116,18 +102,20 @@ class Upsample(nn.Module):
         super().__init__()
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            QuantizedConv2d(in_channels, in_channels, 3, padding=1),
+            QATConv2d(in_channels, in_channels, 3, padding=1),
         )
+
     def forward(self, x, time_emb, y):
         return self.upsample(x)
 
-class AttentionBlock(nn.Module):
+class QATAttentionBlock(nn.Module):
     def __init__(self, in_channels, norm="gn", num_groups=32):
         super().__init__()
         self.in_channels = in_channels
         self.norm = get_norm(norm, in_channels, num_groups)
-        self.to_qkv = nn.Conv2d(in_channels, in_channels * 3, 1)
-        self.to_out = nn.Conv2d(in_channels, in_channels, 1)
+        self.to_qkv = QATConv2d(in_channels, in_channels * 3, 1)
+        self.to_out = QATConv2d(in_channels, in_channels, 1)
+
     def forward(self, x):
         b, c, h, w = x.shape
         q, k, v = torch.split(self.to_qkv(self.norm(x)), self.in_channels, dim=1)
@@ -140,118 +128,96 @@ class AttentionBlock(nn.Module):
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
         return self.to_out(out) + x
 
-class ResidualBlock(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, dropout, time_emb_dim=None, num_classes=None,
-        activation=F.relu, norm="gn", num_groups=32, use_attention=False,
-    ):
+class QATResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout, time_emb_dim, num_classes, norm, num_groups, use_attention):
         super().__init__()
-        self.activation = activation
+        self.quantize_activations = True
+        self.full_precision_activation = nn.SiLU()
+        self.time_activation = nn.SiLU()
+        
         self.norm_1 = get_norm(norm, in_channels, num_groups)
-        self.q_act_1 = QuantizedTernaryActivation()
-        self.conv_1 = QuantizedConv2d(in_channels, out_channels, 3, padding=1)
+        self.conv_1 = QATConv2d(in_channels, out_channels, 3, padding=1)
         self.norm_2 = get_norm(norm, out_channels, num_groups)
-        self.q_act_2 = QuantizedTernaryActivation()
-        self.conv_2 = nn.Sequential(
-            nn.Dropout(p=dropout),
-            QuantizedConv2d(out_channels, out_channels, 3, padding=1),
-        )
-        self.time_bias = QuantizedLinear(time_emb_dim, out_channels) if time_emb_dim is not None else None
+        self.conv_2 = nn.Sequential(nn.Dropout(p=dropout), QATConv2d(out_channels, out_channels, 3, padding=1))
+        self.time_bias = nn.Linear(time_emb_dim, out_channels) if time_emb_dim is not None else None
         self.class_bias = nn.Embedding(num_classes, out_channels) if num_classes is not None else None
-        self.residual_connection = QuantizedConv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        self.attention = nn.Identity() if not use_attention else AttentionBlock(out_channels, norm, num_groups)
-    def forward(self, x, time_emb=None, y=None):
-        out = self.norm_1(x)
-        out = self.activation(out)
-        out = self.q_act_1(out)
-        out = self.conv_1(out)
-        if self.time_bias is not None:
-            if time_emb is None: raise ValueError("Time conditioning was specified but time_emb is not passed")
-            out += self.time_bias(self.activation(time_emb))[:, :, None, None]
-        if self.class_bias is not None:
-            if y is None: raise ValueError("Class conditioning was specified but y is not passed")
-            out += self.class_bias(y)[:, :, None, None]
-        out = self.norm_2(out)
-        out = self.activation(out)
-        out = self.q_act_2(out)
-        out = self.conv_2(out) + self.residual_connection(x)
-        out = self.attention(out)
-        return out
+        self.residual_connection = QATConv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.attention = nn.Identity() if not use_attention else QATAttentionBlock(out_channels, norm, num_groups)
 
-class QAT_UNet(nn.Module):
-    def __init__(
-        self, img_channels, base_channels, channel_mults=(1, 2, 4, 8), num_res_blocks=2,
-        time_emb_dim=None, time_emb_scale=1.0, num_classes=None, activation=F.relu,
-        dropout=0.1, attention_resolutions=(), norm="gn", num_groups=32, initial_pad=0,
-    ):
+    def forward(self, x, time_emb=None, y=None):
+        h = self.norm_1(x)
+        
+        if self.quantize_activations and self.training:
+            h = ScaledActivationTernary.apply(h)
+        else:
+            h = self.full_precision_activation(h)
+            
+        h = self.conv_1(h)
+        
+        if self.time_bias is not None:
+            h += self.time_bias(self.time_activation(time_emb))[:, :, None, None]
+        if self.class_bias is not None:
+            h += self.class_bias(y)[:, :, None, None]
+            
+        h2 = self.norm_2(h)
+        
+        if self.quantize_activations and self.training:
+            h2 = ScaledActivationTernary.apply(h2)
+        else:
+            h2 = self.full_precision_activation(h2)
+            
+        h2 = self.conv_2(h2)
+        
+        return self.attention(h2 + self.residual_connection(x))
+
+class QATUNet(nn.Module):
+    def __init__(self, img_channels, base_channels, channel_mults, num_res_blocks, time_emb_dim, time_emb_scale, num_classes, dropout, attention_resolutions, norm, num_groups, initial_pad):
         super().__init__()
-        self.activation = activation
         self.initial_pad = initial_pad
-        self.num_classes = num_classes
-        self.q_act_time = QuantizedTernaryActivation()
         self.time_mlp = nn.Sequential(
             PositionalEmbedding(base_channels, time_emb_scale),
-            QuantizedLinear(base_channels, time_emb_dim),
-            nn.SiLU(),
-            QuantizedLinear(time_emb_dim, time_emb_dim),
+            nn.Linear(base_channels, time_emb_dim), nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim)
         ) if time_emb_dim is not None else None
-        self.init_conv = QuantizedConv2d(img_channels, base_channels, 3, padding=1)
+        self.init_conv = QATConv2d(img_channels, base_channels, 3, padding=1)
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
         channels = [base_channels]
         now_channels = base_channels
+        
         for i, mult in enumerate(channel_mults):
             out_channels = base_channels * mult
             for _ in range(num_res_blocks):
-                self.downs.append(ResidualBlock(
-                    now_channels, out_channels, dropout, time_emb_dim=time_emb_dim,
-                    num_classes=num_classes, activation=activation, norm=norm,
-                    num_groups=num_groups, use_attention=i in attention_resolutions,
-                ))
+                use_attention = (now_channels in attention_resolutions)
+                self.downs.append(QATResidualBlock(now_channels, out_channels, dropout, time_emb_dim, num_classes, norm, num_groups, use_attention))
                 now_channels = out_channels
                 channels.append(now_channels)
             if i != len(channel_mults) - 1:
                 self.downs.append(Downsample(now_channels))
                 channels.append(now_channels)
+        
         self.mid = nn.ModuleList([
-            ResidualBlock(
-                now_channels, now_channels, dropout, time_emb_dim=time_emb_dim,
-                num_classes=num_classes, activation=activation, norm=norm,
-                num_groups=num_groups, use_attention=True,
-            ),
-            ResidualBlock(
-                now_channels, now_channels, dropout, time_emb_dim=time_emb_dim,
-                num_classes=num_classes, activation=activation, norm=norm,
-                num_groups=num_groups, use_attention=False,
-            ),
+            QATResidualBlock(now_channels, now_channels, dropout, time_emb_dim, num_classes, norm, num_groups, True),
+            QATResidualBlock(now_channels, now_channels, dropout, time_emb_dim, num_classes, norm, num_groups, False),
         ])
+        
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_channels = base_channels * mult
             for _ in range(num_res_blocks + 1):
-                self.ups.append(ResidualBlock(
-                    channels.pop() + now_channels, out_channels, dropout,
-                    time_emb_dim=time_emb_dim, num_classes=num_classes,
-                    activation=activation, norm=norm, num_groups=num_groups,
-                    use_attention=i in attention_resolutions,
-                ))
+                use_attention = (now_channels in attention_resolutions)
+                self.ups.append(QATResidualBlock(channels.pop() + now_channels, out_channels, dropout, time_emb_dim, num_classes, norm, num_groups, use_attention))
                 now_channels = out_channels
             if i != 0:
                 self.ups.append(Upsample(now_channels))
+        
         self.out_norm = get_norm(norm, base_channels, num_groups)
-        self.q_act_out = QuantizedTernaryActivation()
-        self.out_conv = QuantizedConv2d(base_channels, img_channels, 3, padding=1)
+        self.out_activation = nn.SiLU()
+        self.out_conv = nn.Conv2d(base_channels, img_channels, 3, padding=1)
 
     def forward(self, x, time=None, y=None):
         ip = self.initial_pad
         if ip != 0: x = F.pad(x, (ip,) * 4)
-        if self.time_mlp is not None:
-            if time is None: raise ValueError("Time conditioning was specified but time is not passed")
-            time_emb = self.time_mlp(time)
-            time_emb = self.q_act_time(time_emb)
-        else:
-            time_emb = None
-        if self.num_classes is not None and y is None:
-            raise ValueError("Class conditioning was specified but y is not passed")
+        time_emb = self.time_mlp(time) if self.time_mlp is not None else None
         x = self.init_conv(x)
         skips = [x]
         for layer in self.downs:
@@ -260,12 +226,20 @@ class QAT_UNet(nn.Module):
         for layer in self.mid:
             x = layer(x, time_emb, y)
         for layer in self.ups:
-            if isinstance(layer, ResidualBlock):
+            if isinstance(layer, QATResidualBlock):
                 x = torch.cat([x, skips.pop()], dim=1)
             x = layer(x, time_emb, y)
-        x = self.out_norm(x)
-        x = self.activation(x)
-        x = self.q_act_out(x)
+        x = self.out_activation(self.out_norm(x))
         x = self.out_conv(x)
-        if self.initial_pad != 0: return x[:, :, ip:-ip, ip:-ip]
-        else: return x
+        if ip != 0: return x[:, :, ip:-ip, ip:-ip]
+        return x
+
+    def set_quantize_weights(self, enabled: bool):
+        for module in self.modules():
+            if isinstance(module, QATConv2d):
+                module.quantize_weights = enabled
+    
+    def set_quantize_activations(self, enabled: bool):
+        for module in self.modules():
+            if isinstance(module, QATResidualBlock):
+                module.quantize_activations = enabled

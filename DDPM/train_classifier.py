@@ -1,106 +1,171 @@
+# DDPM/train_classifier.py
+# A script to train a classifier on top of the frozen features of a pre-trained QAT-UNet.
+
+import os
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import argparse
 import torchvision
-import torchvision.transforms as transforms
+from tqdm import tqdm
 from torch.utils.data import DataLoader
-from ddpm.qat_classifier import QAT_Classifier 
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Import the necessary components from your project structure
+from ddpm.QAT_UNet import QATUNet
+from ddpm.script_utils_qat import get_transform, cycle
+
+class FeatureClassifier(nn.Module):
+    """A simple classifier to be trained on top of the UNet's features."""
+    def __init__(self, feature_dim, num_classes=10):
+        super().__init__()
+        # The UNet's middle block output is (batch_size, channels, 4, 4)
+        # We flatten this to (batch_size, channels * 4 * 4)
+        self.flatten = nn.Flatten()
+        self.classifier_head = nn.Sequential(
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, features):
+        x = self.flatten(features)
+        return self.classifier_head(x)
 
 def main():
-    # 1. Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    parser = argparse.ArgumentParser(description="Train a classifier on frozen UNet features.")
+    
+    # Paths
+    parser.add_argument("--dataset_path", type=str, default="./data", help="Path to CIFAR-10 dataset")
+    parser.add_argument("--qat_model_path", type=str, default="./qat_unet_progressive.pth", help="Path to the pre-trained QAT UNet model.")
+    
+    # Training Hyperparameters
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--train_steps", type=int, default=10000)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    
+    # UNet Hyperparameters (must match the trained model)
+    parser.add_argument("--base_channels", type=int, default=128)
+    parser.add_argument("--channel_mults", type=str, default="1,2,2,2")
+    parser.add_argument("--num_res_blocks", type=int, default=2)
+    parser.add_argument("--time_emb_dim", type=int, default=512)
+    parser.add_argument("--norm", type=str, default="gn")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--attention_resolutions", type=str, default="1", help="Resolutions for attention blocks")
+    
+    args = parser.parse_args()
+    
+    args.channel_mults = tuple(map(int, args.channel_mults.split(',')))
+    args.attention_resolutions = tuple(map(int, args.attention_resolutions.split(',')))
 
-    # 2. Data
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    trainset = torchvision.datasets.CIFAR10(root='./cifar_train', train=True, download=True, transform=transform)
-    trainloader = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
-    testset = torchvision.datasets.CIFAR10(root='./cifar_test', train=False, download=True, transform=transform)
-    testloader = DataLoader(testset, batch_size=128, shuffle=False, num_workers=4, pin_memory=True)
+    print("="*40)
+    print("Starting Classifier Training on QAT-UNet Features")
+    print("="*40)
 
-    # 3. Model, Loss, and Optimizer
-    model = QAT_Classifier(num_classes=10).to(device)
+    # --- 1. Load Datasets ---
+    train_dataset = torchvision.datasets.CIFAR10(
+        root=args.dataset_path, train=True, download=True, transform=get_transform()
+    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    
+    test_dataset = torchvision.datasets.CIFAR10(
+        root=args.dataset_path, train=False, download=True, transform=get_transform()
+    )
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    # --- 2. Load and Freeze the QAT-UNet ---
+    feature_extractor = QATUNet(
+        img_channels=3, base_channels=args.base_channels, channel_mults=args.channel_mults,
+        num_res_blocks=args.num_res_blocks, time_emb_dim=args.time_emb_dim, time_emb_scale=1.0,
+        num_classes=None, dropout=args.dropout, attention_resolutions=args.attention_resolutions,
+        norm=args.norm, num_groups=32, initial_pad=0,
+    ).to(args.device)
+    
+    print(f"Loading pre-trained QAT-UNet from: {args.qat_model_path}")
+    feature_extractor.load_state_dict(torch.load(args.qat_model_path, map_location=args.device))
+    
+    # Freeze the feature extractor
+    for param in feature_extractor.parameters():
+        param.requires_grad = False
+    feature_extractor.eval()
+    print("QAT-UNet loaded and frozen.")
+
+    # --- 3. Initialize the Classifier ---
+    # Determine feature dimension from a dummy pass
+    dummy_input = torch.randn(1, 3, 32, 32).to(args.device)
+    dummy_time = torch.zeros(1, dtype=torch.long).to(args.device)
+    
+    # We will extract features from the middle of the network
+    # To do this, we modify the forward method slightly to return the mid-block output
+    def get_features(self, x, time=None, y=None):
+        time_emb = self.time_mlp(time) if self.time_mlp is not None else None
+        x = self.init_conv(x)
+        skips = [x]
+        for layer in self.downs:
+            x = layer(x, time_emb, y)
+            skips.append(x)
+        for layer in self.mid:
+            x = layer(x, time_emb, y)
+        return x # Return features from the middle block
+    
+    with torch.no_grad():
+        features = get_features(feature_extractor, dummy_input, dummy_time)
+        feature_dim = features.shape[1] * features.shape[2] * features.shape[3]
+    
+    classifier = FeatureClassifier(feature_dim=feature_dim, num_classes=10).to(args.device)
+    
+    # --- 4. Train the Classifier ---
+    optimizer = torch.optim.AdamW(classifier.parameters(), lr=args.learning_rate)
     criterion = nn.CrossEntropyLoss()
     
-    # Separate parameters for different learning rates
-    scale_params = []
-    other_params = []
-    for name, param in model.named_parameters():
-        if 'scale' in name:
-            scale_params.append(param)
-        else:
-            other_params.append(param)
-
-    # Set up the optimizer with two parameter groups
-    optimizer = optim.AdamW([
-        {'params': other_params},
-        {'params': scale_params, 'lr': 5e-3}  # Higher learning rate for scale parameters
-    ], lr=5e-4, weight_decay=1e-6) # Base learning rate for other parameters
+    pbar = tqdm(range(args.train_steps))
+    data_iter = cycle(train_dataloader)
     
-    # --- Training Configuration ---
-    num_epochs = 35 
-    warmup_epochs = 10  # Number of epochs to train before enabling quantization
-    
-    print(f"Starting training for {num_epochs} epochs with a {warmup_epochs} epoch warm-up...")
-
-    # 4. Training Loop
-    for epoch in range(1, num_epochs + 1):
-        # --- Warm-up and Learning Rate Schedule Logic ---
-        is_quant_epoch = epoch > warmup_epochs
+    for i in pbar:
+        classifier.train()
+        optimizer.zero_grad()
         
-        # At the end of the warm-up, reduce the learning rate for stable fine-tuning
-        if epoch == warmup_epochs + 1:
-            print("\n--- Warm-up finished. Quantization is now ENABLED. ---")
-        # Enable quantization on all relevant modules
-        for module in model.modules():
-            if hasattr(module, 'quantize'):
-                module.quantize = is_quant_epoch
-
-        # --- Train for one epoch ---
-        model.train()
-        running_loss = 0.0
-        for inputs, labels in trainloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
+        x, y = next(data_iter)
+        x, y = x.to(args.device), y.to(args.device)
         
-        epoch_loss = running_loss / len(trainloader)
-
-        # --- Evaluate on the test set ---
-        model.eval()
-        correct = 0
-        total = 0
+        # We use t=0 to extract features from the original, non-noised images
+        t = torch.zeros(x.shape[0], dtype=torch.long, device=args.device)
+        
         with torch.no_grad():
-            for images, labels in testloader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+            features = get_features(feature_extractor, x, t)
+            
+        logits = classifier(features)
+        loss = criterion(logits, y)
         
-        accuracy = 100 * correct / total
+        loss.backward()
+        optimizer.step()
         
-        # --- Print Epoch Statistics ---
-        try:
-            scale1 = model.q_act1.scale.item()
-            scale4 = model.q_act4.scale.item()
-            print(f'Epoch [{epoch}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {accuracy:.2f}% | Scales: q1={scale1:.3f}, q4={scale4:.3f}')
-        except AttributeError:
-            print(f'Epoch [{epoch}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {accuracy:.2f}%')
+        pbar.set_description(f"Classifier Loss: {loss.item():.4f}")
+
+    print("Classifier training complete.")
+
+    # --- 5. Evaluate the Classifier ---
+    classifier.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in tqdm(test_dataloader, desc="Evaluating"):
+            x, y = x.to(args.device), y.to(args.device)
+            t = torch.zeros(x.shape[0], dtype=torch.long, device=args.device)
+            
+            features = get_features(feature_extractor, x, t)
+            logits = classifier(features)
+            
+            _, predicted = torch.max(logits.data, 1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+
+    accuracy = 100 * correct / total
+    print("="*40)
+    print(f"Final Classification Accuracy: {accuracy:.2f}%")
+    print("="*40)
 
 
-    print('Finished Training')
-    torch.save(model.state_dict(), 'qat_classifier_cifar10_final.pth')
-    print('Model saved to qat_classifier_cifar10_final.pth')
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
