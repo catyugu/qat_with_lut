@@ -70,7 +70,6 @@ def diffusion_defaults():
         time_emb_dim=128 * 4,
         norm="gn",
         dropout=0.1,
-        activation="silu", # This default is kept for consistency but will not be used by QAT_UNet
         attention_resolutions=(1,),
 
         ema_decay=0.9999,

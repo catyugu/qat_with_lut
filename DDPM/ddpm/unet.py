@@ -352,7 +352,7 @@ class UNet(nn.Module):
 
         if self.time_mlp is not None:
             if time is None:
-                raise ValueError("time conditioning was specified but tim is not passed")
+                raise ValueError("time conditioning was specified but time is not passed")
             
             time_emb = self.time_mlp(time)
         else:

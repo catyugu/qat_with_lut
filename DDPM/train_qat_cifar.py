@@ -108,6 +108,8 @@ def main():
                 print(f"test_loss: {test_loss:.4f}, train_loss: {acc_train_loss:.4f}, iteration: {iteration}")
                 
                 ##save samples
+                import os
+                os.makedirs('samples', exist_ok=True)
                 for i, sample in enumerate(samples):
                     script_utils_qat.save_image(sample, f"samples/{args.project_name}-{args.run_name}-iteration-{iteration}-sample-{i}.png")
 
