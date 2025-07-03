@@ -41,9 +41,9 @@ def main():
     
     # Training Hyperparameters
     parser.add_argument("--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--train_steps", type=int, default=1000)
+    parser.add_argument("--train_steps", type=int, default=5000)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
     
     # UNet Hyperparameters (must match the trained model)
     parser.add_argument("--base_channels", type=int, default=128)
