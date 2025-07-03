@@ -8,3 +8,4 @@ DDPM/data
 DDPM/.gitignore
 DDPM/.README.md
 DDPM/samples
+DDPM/nohup.out
