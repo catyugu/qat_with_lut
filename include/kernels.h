@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint> // For uint8_t, int16_t, int32_t
 #include <omp.h>   // Add this line
+#include "types.h" // Include types.h for model data structures
 // Forward declarations for structs defined in types.h
 struct LutLayer;
 struct WeightsOnlyQuantLayer;
@@ -74,14 +75,5 @@ void standard_linear_forward(
     int output_dim,
     int batch_size
 );
-
-void lut_conv2d_forward(
-    const LutConvLayer& layer,
-    const std::vector<float>& input, // Input feature map
-    std::vector<float>& output,      // Output feature map
-    int input_h, int input_w,
-    const int32_t* precomputed_lut_ptr
-);
-
 
 #endif // KERNELS_H
