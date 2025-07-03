@@ -2,7 +2,7 @@ import argparse
 import torchvision
 import torch.nn.functional as F
 import torch
-from .unet import UNet # Assuming this now points to QAT_UNet or UNet is replaced
+from .QAT_UNet import QAT_UNet # Assuming this now points to QAT_UNet or UNet is replaced
 from PIL import Image
 from .diffusion import (
     GaussianDiffusion,
@@ -85,7 +85,7 @@ def get_diffusion_from_args(args):
     # We still need to ensure that the UNet import points to your QAT_UNet.py
     # either by renaming QAT_UNet.py to unet.py or by changing the import.
 
-    model = UNet(
+    model = QAT_UNet(
         img_channels=3,
 
         base_channels=args.base_channels,

@@ -267,3 +267,101 @@ void standard_linear_forward(
         }
     }
 }
+
+void im2col(const std::vector<float>& input, int channels, int height, int width,
+            int kernel_h, int kernel_w, int stride_h, int stride_w,
+            int pad_h, int pad_w, std::vector<float>& col) {
+
+    int output_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int output_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
+    int col_rows = channels * kernel_h * kernel_w;
+    int col_cols = output_h * output_w;
+
+    col.assign(col_rows * col_cols, 0.0f);
+
+    for (int c = 0; c < channels; ++c) {
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int input_row = -pad_h + kh;
+                for (int oh = 0; oh < output_h; ++oh) {
+                    int input_col = -pad_w + kw;
+                    for (int ow = 0; ow < output_w; ++ow) {
+                        int col_index = (c * kernel_h * kernel_w + kh * kernel_w + kw) * (output_h * output_w) + oh * output_w + ow;
+                        int input_h_idx = input_row + oh * stride_h;
+                        int input_w_idx = input_col + ow * stride_w;
+
+                        if (input_h_idx >= 0 && input_h_idx < height && input_w_idx >= 0 && input_w_idx < width) {
+                            col[col_index] = input[c * width * height + input_h_idx * width + input_w_idx];
+                        } else {
+                            col[col_index] = 0; // Padding
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// --- NEW: Accelerated Convolution Forward Pass ---
+/**
+ * @brief Performs a 2D convolution using the im2col + GEMM approach with LUT acceleration.
+ */
+void lut_conv2d_forward(
+    const LutConvLayer& layer,
+    const std::vector<float>& input,
+    std::vector<float>& output,
+    int input_h, int input_w,
+    const int32_t* precomputed_lut_ptr
+) {
+    // 1. Calculate output dimensions
+    int output_h = (input_h + 2 * layer.padding - layer.kernel_size) / layer.stride + 1;
+    int output_w = (input_w + 2 * layer.padding - layer.kernel_size) / layer.stride + 1;
+    output.resize(layer.out_channels * output_h * output_w);
+
+    // 2. Perform im2col on the input feature map
+    std::vector<float> im2col_matrix;
+    im2col(input, layer.in_channels, input_h, input_w,
+           layer.kernel_size, layer.kernel_size, layer.stride, layer.stride,
+           layer.padding, layer.padding, im2col_matrix);
+
+    // 3. Quantize and pack the im2col matrix (activations)
+    std::vector<int8_t> im2col_quantized(im2col_matrix.size());
+    quantize_float_to_int8_with_scale(im2col_matrix.data(), im2col_quantized.data(), layer.activation_scale, im2col_matrix.size());
+
+    std::vector<uint8_t> im2col_packed(get_packed_size(im2col_matrix.size()));
+    pack_ternary_activations_5x3bit_to_ptr(im2col_quantized.data(), im2col_packed.data(), im2col_quantized.size());
+
+    // 4. The layer weights are already packed. We can use them directly.
+    // The GEMM dimensions will be:
+    // M = out_channels
+    // N = output_h * output_w
+    // K = in_channels * kernel_size * kernel_size
+    int M = layer.out_channels;
+    int N = output_h * output_w;
+    int K = layer.in_channels * layer.kernel_size * layer.kernel_size;
+
+    // 5. Perform GEMM
+    std::vector<int32_t> C_i32(M * N);
+    avx2_bit_slice_gemm_kernel(
+        layer.packed_weights.data(),
+        im2col_packed.data(),
+        C_i32.data(),
+        M, N, K,
+        precomputed_lut_ptr
+    );
+
+    // 6. Dequantize, add bias, and store the result in the output vector
+    // This part needs careful handling of indices to reshape the GEMM output
+    // back into the image format.
+    for (int m = 0; m < M; ++m) { // Loop over output channels
+        for (int n = 0; n < N; ++n) { // Loop over output pixels (h*w)
+            // Dequantize the result
+            float dequantized_val = static_cast<float>(C_i32[m * N + n]) / layer.activation_scale;
+            // Add bias
+            dequantized_val += layer.bias[m];
+            // Assign to the final output tensor
+            output[m * N + n] = dequantized_val;
+        }
+    }
+}

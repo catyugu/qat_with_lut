@@ -75,4 +75,13 @@ void standard_linear_forward(
     int batch_size
 );
 
+void lut_conv2d_forward(
+    const LutConvLayer& layer,
+    const std::vector<float>& input, // Input feature map
+    std::vector<float>& output,      // Output feature map
+    int input_h, int input_w,
+    const int32_t* precomputed_lut_ptr
+);
+
+
 #endif // KERNELS_H
