@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--total_train_steps", type=int, default=60000, help="Total steps.")
     parser.add_argument("--sample_interval", type=int, default=1000, help="Frequency of saving sample images.")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     
     # Diffusion Hyperparameters
     parser.add_argument("--num_timesteps", type=int, default=1000)

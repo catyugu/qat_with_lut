@@ -17,7 +17,7 @@ class ScaledWeightTernary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight):
         alpha = torch.mean(torch.abs(weight)).detach()
-        threshold = 0.0001
+        threshold = 0.001 * alpha
         quantized_weight = torch.where(weight > threshold, 1.0, 
                                        torch.where(weight < -threshold, -1.0, 0.0))
         scaled_quantized_weight = alpha * quantized_weight
@@ -39,7 +39,7 @@ class ScaledActivationTernary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         alpha = torch.mean(torch.abs(x)).detach()
-        threshold = 0.05 * alpha
+        threshold = 0.001 * alpha
         quantized_x = torch.where(x > threshold, 1.0, 
                                   torch.where(x < -threshold, -1.0, 0.0))
         scaled_quantized_x = alpha * quantized_x
@@ -59,9 +59,9 @@ class QATConv2d(nn.Conv2d):
         self.quantize_weights = True
 
     def forward(self, x):
-        if self.quantize_weights and self.training:
+        if self.quantize_weights:
             quantized_weight = ScaledWeightTernary.apply(self.weight)
-            return F.conv2d(x, quantized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+            return F.conv2d(self, x, quantized_weight, self.bias)
         else:
             return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
