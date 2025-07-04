@@ -17,7 +17,7 @@ class ScaledWeightTernary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight):
         alpha = torch.mean(torch.abs(weight)).detach()
-        threshold = 0.001 * alpha
+        threshold = 0.0001
         quantized_weight = torch.where(weight > threshold, 1.0, 
                                        torch.where(weight < -threshold, -1.0, 0.0))
         scaled_quantized_weight = alpha * quantized_weight
@@ -108,23 +108,106 @@ class Upsample(nn.Module):
     def forward(self, x, time_emb, y):
         return self.upsample(x)
 
-class QATAttentionBlock(nn.Module):
+class HadamardTransform(nn.Module):
+    """
+    Applies a Hadamard transform to the input tensor along the last dimension.
+    Pads to the nearest power of 2 if necessary.
+    Note: For large dimensions, a true Fast Hadamard Transform (FHT) algorithm
+    is required for efficiency. This implementation uses direct matrix multiplication
+    which can be slow for large N.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        # Calculate the next power of 2 for padding
+        self.target_dim = 2**math.ceil(math.log2(dim)) if dim > 0 else 0
+        
+        if self.target_dim == 0:
+            self.hadamard_matrix = None
+        else:
+            # Generate the Hadamard matrix
+            # Normalized by sqrt(N) for orthogonality
+            self.hadamard_matrix = self._get_hadamard_matrix(self.target_dim) / math.sqrt(self.target_dim)
+
+    def _get_hadamard_matrix(self, n):
+        # Recursively generates a Hadamard matrix of size n (must be power of 2)
+        if n == 1:
+            return torch.tensor([[1.]])
+        else:
+            h_n_div_2 = self._get_hadamard_matrix(n // 2)
+            top_row = torch.cat([h_n_div_2, h_n_div_2], dim=1)
+            bottom_row = torch.cat([h_n_div_2, -h_n_div_2], dim=1)
+            return torch.cat([top_row, bottom_row], dim=0)
+
+    def forward(self, x):
+        if self.hadamard_matrix is None:
+            # If dim is 0 or invalid, return original or handle error
+            return x 
+        
+        original_shape = x.shape # (B, C, H, W)
+        # Reshape to (Batch*H*W, Channels) for matrix multiplication
+        # We want to apply Hadamard along the channel dimension (dim=1 in original x)
+        x_reshaped = x.permute(0, 2, 3, 1).reshape(-1, self.dim) # (B*H*W, C)
+
+        # Pad if the original channel dimension is not a power of 2
+        if self.dim < self.target_dim:
+            padding_needed = self.target_dim - self.dim
+            x_padded = F.pad(x_reshaped, (0, padding_needed)) # Pad last dimension
+        else:
+            x_padded = x_reshaped
+
+        # Move Hadamard matrix to the correct device
+        hadamard_matrix_on_device = self.hadamard_matrix.to(x.device)
+        
+        # Apply Hadamard transform (matrix multiplication)
+        transformed_x = torch.matmul(x_padded, hadamard_matrix_on_device)
+
+        # Unpad if necessary
+        if self.dim < self.target_dim:
+            transformed_x = transformed_x[:, :self.dim] # Slice back to original dimension
+        
+        # Reshape back to (B, C, H, W)
+        transformed_x = transformed_x.reshape(original_shape[0], original_shape[2], original_shape[3], original_shape[1]).permute(0, 3, 1, 2)
+        
+        return transformed_x
+
+
+class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
     def __init__(self, in_channels, norm="gn", num_groups=32):
         super().__init__()
         self.in_channels = in_channels
         self.norm = get_norm(norm, in_channels, num_groups)
+        # CHANGED: Use QATConv2d for quantized linear layers
         self.to_qkv = QATConv2d(in_channels, in_channels * 3, 1)
         self.to_out = QATConv2d(in_channels, in_channels, 1)
 
+        # Initialize Hadamard transforms for Q, K, V
+        self.hadamard_q = HadamardTransform(in_channels)
+        self.hadamard_k = HadamardTransform(in_channels)
+        self.hadamard_v = HadamardTransform(in_channels)
+
+
     def forward(self, x):
         b, c, h, w = x.shape
+        # Project to Q, K, V using quantized convolutions
         q, k, v = torch.split(self.to_qkv(self.norm(x)), self.in_channels, dim=1)
+        
+        # Apply Hadamard Transform to Q, K, V (operates on float outputs of QATConv2d)
+        q = self.hadamard_q(q)
+        k = self.hadamard_k(k)
+        v = self.hadamard_v(v)
+
+        # Reshape for attention
         q = q.permute(0, 2, 3, 1).view(b, h * w, c)
         k = k.view(b, c, h * w)
         v = v.permute(0, 2, 3, 1).view(b, h * w, c)
+        
+        # Scaled Dot-Product Attention (full precision)
         dot_products = torch.bmm(q, k) * (c ** (-0.5))
         attention = torch.softmax(dot_products, dim=-1)
         out = torch.bmm(attention, v)
+        
+        # Reshape back and final projection using quantized convolution
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
         return self.to_out(out) + x
 
@@ -142,7 +225,7 @@ class QATResidualBlock(nn.Module):
         self.time_bias = nn.Linear(time_emb_dim, out_channels) if time_emb_dim is not None else None
         self.class_bias = nn.Embedding(num_classes, out_channels) if num_classes is not None else None
         self.residual_connection = QATConv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        self.attention = nn.Identity() if not use_attention else QATAttentionBlock(out_channels, norm, num_groups)
+        self.attention = nn.Identity() if not use_attention else AttentionBlock(out_channels, norm, num_groups) # Renamed
 
     def forward(self, x, time_emb=None, y=None):
         h = self.norm_1(x)

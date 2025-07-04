@@ -26,10 +26,7 @@ int main() {
 
     // 2. Load the model parameters
     auto start_load = std::chrono::high_resolution_clock::now();
-    if (!unet_model.load_model(model_file_path, precomputed_lut)) {
-        std::cerr << "Failed to load QAT UNet model. Exiting." << std::endl;
-        return 1;
-    }
+    unet_model.load_model(model_file_path);
     auto end_load = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> load_duration = end_load - start_load;
     std::cout << "Model loaded in " << load_duration.count() << " seconds." << std::endl;
