@@ -6,6 +6,11 @@
 #include "utils.h"   // Include utils.h for functions like convert_int8_to_ternary_activation, pack_ternary_activations_5x3bit etc.
 
 #include <iostream> // For debugging, remove in final build
+#include <cmath>
+#include <vector>
+#include <numeric>
+#include <stdexcept>
+#include <limits> // Required for std::numeric_limits
 
 // --- SIMD 核心内核实现 ---
 
@@ -300,4 +305,291 @@ void im2col(const std::vector<float>& input, int channels, int height, int width
             }
         }
     }
+}
+// --- Activation Functions ---
+
+Tensor silu(const Tensor& input) {
+    Tensor output = input; // Copy shape and data
+    for (size_t i = 0; i < output.data.size(); ++i) {
+        output.data[i] = input.data[i] / (1.0f + std::exp(-input.data[i]));
+    }
+    return output;
+}
+
+Tensor softmax(const Tensor& input) {
+    Tensor output = input;
+    size_t last_dim = input.shape.back();
+    size_t outer_dims = input.data.size() / last_dim;
+
+    for (size_t i = 0; i < outer_dims; ++i) {
+        float max_val = -std::numeric_limits<float>::infinity();
+        for (size_t j = 0; j < last_dim; ++j) {
+            if (input.data[i * last_dim + j] > max_val) {
+                max_val = input.data[i * last_dim + j];
+            }
+        }
+
+        float sum_exp = 0.0f;
+        for (size_t j = 0; j < last_dim; ++j) {
+            float val = std::exp(input.data[i * last_dim + j] - max_val);
+            output.data[i * last_dim + j] = val;
+            sum_exp += val;
+        }
+
+        for (size_t j = 0; j < last_dim; ++j) {
+            output.data[i * last_dim + j] /= sum_exp;
+        }
+    }
+    return output;
+}
+
+
+// --- Layer Kernels ---
+
+Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
+    const auto& in_shape = input.shape;
+    size_t B = in_shape[0], C_in = in_shape[1], H_in = in_shape[2], W_in = in_shape[3];
+    size_t C_out = layer.out_channels, KH = layer.kernel_size_h, KW = layer.kernel_size_w;
+    size_t SH = layer.stride_h, SW = layer.stride_w, PH = layer.pad_h, PW = layer.pad_w;
+    size_t G = layer.groups;
+
+    size_t H_out = (H_in + 2 * PH - KH) / SH + 1;
+    size_t W_out = (W_in + 2 * PW - KW) / SW + 1;
+
+    Tensor output({B, C_out, H_out, W_out});
+    
+    std::vector<float> dequantized_weights(layer.packed_weights.size());
+    for(size_t i = 0; i < layer.packed_weights.size(); ++i) {
+        dequantized_weights[i] = static_cast<float>(static_cast<int8_t>(layer.packed_weights[i])) * layer.weight_scale;
+    }
+
+    size_t C_in_per_group = C_in / G;
+    
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t g = 0; g < G; ++g) {
+            for (size_t c_out_g = 0; c_out_g < C_out / G; ++c_out_g) {
+                size_t c_out = g * (C_out / G) + c_out_g;
+                for (size_t h_out = 0; h_out < H_out; ++h_out) {
+                    for (size_t w_out = 0; w_out < W_out; ++w_out) {
+                        float acc = 0.0f;
+                        for (size_t c_in_g = 0; c_in_g < C_in_per_group; ++c_in_g) {
+                            size_t c_in = g * C_in_per_group + c_in_g;
+                            for (size_t kh = 0; kh < KH; ++kh) {
+                                for (size_t kw = 0; kw < KW; ++kw) {
+                                    int h_in_idx = h_out * SH - PH + kh;
+                                    int w_in_idx = w_out * SW - PW + kw;
+                                    if (h_in_idx >= 0 && h_in_idx < H_in && w_in_idx >= 0 && w_in_idx < W_in) {
+                                        float in_val = input.at({b, c_in, (size_t)h_in_idx, (size_t)w_in_idx});
+                                        float w_val = dequantized_weights[
+                                            c_out * (C_in_per_group * KH * KW) +
+                                            c_in_g * (KH * KW) +
+                                            kh * KW + kw ];
+                                        acc += in_val * w_val;
+                                    }
+                                }
+                            }
+                        }
+                        output.at({b, c_out, h_out, w_out}) = acc;
+                    }
+                }
+                for (size_t h_out = 0; h_out < H_out; ++h_out) {
+                    for (size_t w_out = 0; w_out < W_out; ++w_out) {
+                        output.at({b, c_out, h_out, w_out}) += layer.bias[c_out];
+                    }
+                }
+            }
+        }
+    }
+    return output;
+}
+
+Tensor linear(const Tensor& input, const LinearLayer& layer) {
+    const auto& in_shape = input.shape;
+    size_t B = (in_shape.size() > 1) ? in_shape[0] : 1;
+    size_t in_features = in_shape.back();
+    size_t out_features = layer.out_features;
+    
+    Tensor output({B, out_features});
+
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t out_f = 0; out_f < out_features; ++out_f) {
+            float acc = 0.0f;
+            for (size_t in_f = 0; in_f < in_features; ++in_f) {
+                float in_val = input.data[b * in_features + in_f];
+                float w_val = layer.weights[out_f * in_features + in_f];
+                acc += in_val * w_val;
+            }
+            output.data[b * out_features + out_f] = acc + layer.bias[out_f];
+        }
+    }
+    return output;
+}
+
+Tensor group_norm(const Tensor& input, const GroupNormLayer& layer) {
+    const auto& shape = input.shape;
+    size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
+    size_t G = layer.num_groups, C_per_group = C / G;
+
+    Tensor output = input;
+
+    for (size_t b = 0; b < B; ++b) {
+        for (size_t g = 0; g < G; ++g) {
+            float sum = 0.0f;
+            for (size_t c = 0; c < C_per_group; ++c) {
+                for (size_t h = 0; h < H; ++h) {
+                    for (size_t w = 0; w < W; ++w) {
+                        sum += input.at({b, g * C_per_group + c, h, w});
+                    }
+                }
+            }
+            float mean = sum / (C_per_group * H * W);
+
+            float sum_sq_diff = 0.0f;
+            for (size_t c = 0; c < C_per_group; ++c) {
+                for (size_t h = 0; h < H; ++h) {
+                    for (size_t w = 0; w < W; ++w) {
+                        float diff = input.at({b, g * C_per_group + c, h, w}) - mean;
+                        sum_sq_diff += diff * diff;
+                    }
+                }
+            }
+            float variance = sum_sq_diff / (C_per_group * H * W);
+            float std_dev = std::sqrt(variance + layer.eps);
+
+            for (size_t c = 0; c < C_per_group; ++c) {
+                size_t channel_idx = g * C_per_group + c;
+                for (size_t h = 0; h < H; ++h) {
+                    for (size_t w = 0; w < W; ++w) {
+                        float normalized = (input.at({b, channel_idx, h, w}) - mean) / std_dev;
+                        output.at({b, channel_idx, h, w}) = normalized * layer.weight[channel_idx] + layer.bias[channel_idx];
+                    }
+                }
+            }
+        }
+    }
+    return output;
+}
+
+Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
+    const auto& shape = input.shape;
+    size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
+
+    Tensor h = group_norm(input, *block.norm);
+    Tensor qkv = conv2d(h, *block.to_qkv);
+
+    Tensor q = qkv.slice(1, 0, C);
+    Tensor k = qkv.slice(1, C, C);
+    Tensor v = qkv.slice(1, C * 2, C);
+
+    q.reshape({B, C, H * W});
+    k.reshape({B, C, H * W});
+    v.reshape({B, C, H * W});
+
+    q = q.permute({0, 2, 1}); 
+    k = k.permute({0, 2, 1}); 
+    v = v.permute({0, 2, 1}); 
+    
+    Tensor scores = q.matmul(k.transpose(1, 2)); 
+    scores = scores.mul_scalar(1.0f / std::sqrt(static_cast<float>(C)));
+    scores = softmax(scores);
+
+    Tensor out = scores.matmul(v);
+    out.reshape({B, H, W, C});
+    out = out.permute({0, 3, 1, 2});
+
+    out = conv2d(out, *block.to_out);
+    return input.add(out);
+}
+
+Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block) {
+    Tensor h = group_norm(input, *block.norm_1);
+    h = silu(h);
+    h = conv2d(h, *block.conv_1);
+
+    if (block.time_bias) {
+        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
+        time_bias.reshape({1, (size_t)block.conv_1->out_channels, 1, 1});
+        h = h.add(time_bias);
+    }
+
+    Tensor h2 = group_norm(h, *block.norm_2);
+    h2 = silu(h2);
+    h2 = conv2d(h2, *block.conv_2);
+
+    Tensor residual_conn = input;
+    if (block.residual_connection) {
+        residual_conn = conv2d(input, *block.residual_connection);
+    }
+
+    Tensor out = h2.add(residual_conn);
+
+    if (block.attention) {
+        out = attention_block(out, *block.attention);
+    }
+    
+    return out;
+}
+
+Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer) {
+    size_t B = time.shape[0];
+    size_t dim = layer.dim;
+    size_t half_dim = dim / 2;
+    
+    Tensor output({B, dim});
+
+    float log_10000 = std::log(10000.0f);
+
+    for(size_t b = 0; b < B; ++b) {
+        for(size_t i = 0; i < half_dim; ++i) {
+            float emb = std::exp(static_cast<float>(i) * -log_10000 / (half_dim - 1.0f));
+            float arg = time.data[b] * layer.time_emb_scale * emb;
+            output.at({b, i}) = std::sin(arg);
+            output.at({b, i + half_dim}) = std::cos(arg);
+        }
+    }
+    return output;
+}
+
+// --- Main Model Forward Pass ---
+
+Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor& time) {
+    Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
+    time_emb = linear(time_emb, *model.time_mlp_linear1);
+    time_emb = silu(time_emb);
+    time_emb = linear(time_emb, *model.time_mlp_linear2);
+
+    Tensor h = conv2d(x, *model.init_conv);
+    
+    std::vector<Tensor> skips;
+    skips.push_back(h);
+
+    for (const auto& layer_ptr : model.downs) {
+        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            h = residual_block(h, time_emb, *res_block);
+        } else if (auto* downsample_block = dynamic_cast<DownsampleLayer*>(layer_ptr.get())) {
+            h = conv2d(h, *downsample_block->conv);
+        }
+        skips.push_back(h);
+    }
+
+    h = residual_block(h, time_emb, *model.middle_block1);
+    h = residual_block(h, time_emb, *model.middle_block2);
+
+    for (const auto& layer_ptr : model.ups) {
+        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            Tensor skip = skips.back();
+            skips.pop_back();
+            h = h.cat(skip, 1); 
+            h = residual_block(h, time_emb, *res_block);
+        } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
+            h = h.upsample(2);
+            h = conv2d(h, *upsample_block->conv);
+        }
+    }
+    
+    h = group_norm(h, *model.final_norm);
+    h = silu(h);
+    h = conv2d(h, *model.final_conv);
+
+    return h;
 }

@@ -4,7 +4,9 @@
 #include <vector>
 #include <cstdint> // For uint8_t, int16_t, int32_t
 #include <omp.h>   // Add this line
-#include "types.h" // Include types.h for model data structures
+#include "qat_unet_model.h"
+#include "types.h"
+#include "utils.h" // Assuming Tensor is defined here or in types.h
 // Forward declarations for structs defined in types.h
 struct LutLayer;
 struct WeightsOnlyQuantLayer;
@@ -75,5 +77,34 @@ void standard_linear_forward(
     int output_dim,
     int batch_size
 );
+Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer);
 
+// Performs a standard linear (fully connected) layer operation
+Tensor linear(const Tensor& input, const LinearLayer& layer);
+
+// Applies Group Normalization
+Tensor group_norm(const Tensor& input, const GroupNormLayer& layer);
+
+// Applies the SiLU activation function (Sigmoid-weighted Linear Unit)
+Tensor silu(const Tensor& input);
+
+// Applies the Softmax activation function along the last dimension
+Tensor softmax(const Tensor& input);
+
+// --- Composite Block Kernels ---
+
+// Performs the forward pass for an Attention block
+Tensor attention_block(const Tensor& input, const AttentionBlock& block);
+
+// Performs the forward pass for a complete QATResidualBlock
+Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block);
+
+// --- Main Model Forward Pass ---
+
+// Orchestrates the full forward pass of the QATUNet model
+Tensor forward_qat_unet(
+    const QATUNetModel& model,
+    const Tensor& x,
+    const Tensor& time
+);
 #endif // KERNELS_H
