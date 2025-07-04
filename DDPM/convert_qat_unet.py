@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import struct
 import numpy as np
-from ddpm.QAT_UNet import QATUNet, QATResidualBlock, AttentionBlock, Downsample, Upsample, QATConv2d
+from ddpm.QAT_UNet import QATUNet, QATResidualBlock, AttentionBlock, Downsample, Upsample, QATConv2d, ScaledWeightTernary
 
 # Helper functions to write data to the binary file
 def write_int(f, val):
@@ -26,9 +26,8 @@ def write_packed_tensor(f, tensor):
 
 def export_conv(f, layer):
     """Exports a Conv2d layer, using custom ternary quantization for QATConv2d."""
-    # Check if the layer is our custom QATConv2d
     is_custom_qat = isinstance(layer, QATConv2d)
-    
+
     # Write common parameters
     write_int(f, layer.in_channels)
     write_int(f, layer.out_channels)
@@ -39,30 +38,28 @@ def export_conv(f, layer):
     write_int(f, layer.padding[0])
     write_int(f, layer.padding[1])
     write_int(f, layer.groups)
-    
+
     if is_custom_qat:
         print(f"  Exporting Custom Ternary QAT Conv2d: in={layer.in_channels}, out={layer.out_channels}")
         weight = layer.weight.detach()
         bias = layer.bias.detach()
 
         # Apply the custom ternary quantization logic from QAT_UNet.py
-        alpha = torch.mean(torch.abs(weight))
-        threshold = 0.0001  # This is the fixed threshold from ScaledWeightTernary
-        quantized_weight = torch.where(weight > threshold, 1.0,
-                                      torch.where(weight < -threshold, -1.0, 0.0))
-        
+        quantized_weight_float = ScaledWeightTernary.apply(weight)
+
         # Pack the {-1, 0, 1} float tensor into an int8 tensor for export
-        packed_weight_int8 = quantized_weight.to(torch.int8)
+        packed_weight_int8 = quantized_weight_float.to(torch.int8)
 
         # Write scale (alpha) and packed weights
-        write_float(f, alpha.item())
+        alpha = torch.mean(torch.abs(weight)).item()
+        write_float(f, alpha)
         write_int(f, packed_weight_int8.numel())
         write_packed_tensor(f, packed_weight_int8)
-        
+
         # Write bias
         write_int(f, bias.numel())
         write_tensor(f, bias)
-    else: # Standard nn.Conv2d (like the final out_conv)
+    else: # Standard nn.Conv2d
         print(f"  Exporting Float Conv2d: in={layer.in_channels}, out={layer.out_channels}")
         weight, bias = layer.weight, layer.bias
         write_float(f, 1.0) # Scale is 1.0 for non-quantized
@@ -71,20 +68,20 @@ def export_conv(f, layer):
         write_int(f, bias.numel())
         write_tensor(f, bias)
 
+
 def export_linear(f, layer):
     """Exports a Linear layer. Assumes it's always float for this model."""
-    # The model definition only uses standard nn.Linear, so we only need to handle the float case.
     print(f"  Exporting Float Linear: in={layer.in_features}, out={layer.out_features}")
     weight, bias = layer.weight, layer.bias
-    
+
     write_int(f, layer.in_features)
     write_int(f, layer.out_features)
-    
+
     # Export float weights
     write_float(f, 1.0) # Scale is 1.0 for non-quantized
     write_int(f, weight.numel())
     write_tensor(f, weight)
-    
+
     # Export bias
     write_int(f, bias.numel())
     write_tensor(f, bias)
@@ -100,7 +97,7 @@ def export_norm(f, layer):
     write_int(f, layer.bias.numel())
     write_tensor(f, layer.bias)
     print(f"  Exported GroupNorm: groups={layer.num_groups}, channels={layer.num_channels}")
-    
+
 def export_attention_block(f, block):
     """Exports an AttentionBlock."""
     print("  Exporting Nested AttentionBlock...")
@@ -116,7 +113,7 @@ def export_res_block(f, block):
     if block.time_bias is not None:
         export_linear(f, block.time_bias)
     export_norm(f, block.norm_2)
-    export_conv(f, block.conv_2[1])
+    export_conv(f, block.conv_2[1]) # Access the QATConv2d within the nn.Sequential
     if isinstance(block.residual_connection, nn.Conv2d):
         export_conv(f, block.residual_connection)
     if isinstance(block.attention, AttentionBlock):
@@ -133,14 +130,14 @@ def main():
         "num_res_blocks": 2,
         "time_emb_dim": 512,
         "time_emb_scale": 1.0,
-        "num_classes": None,
+        "num_classes": 10,
         "dropout": 0.1,
         "attention_resolutions": [1],
         "norm": "gn",
         "num_groups": 32,
         "initial_pad": 0
     }
-    
+
     model_path = "qat_unet_progressive.pth"
     output_path = "qat_unet_model.bin"
 
@@ -161,17 +158,14 @@ def main():
 
     print("Loading QAT UNet model...")
     model = QATUNet(**model_init_config)
-    
+
     model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
     model.eval()
     print("Model loaded successfully.")
 
-    # --- REMOVED torch.quantization block ---
-    # We are now manually applying the custom ternary quantization during export.
-
     with open(output_path, "wb") as f:
         print("\n--- Starting Export ---")
-        
+
         # 1. Write Hyperparameters
         print("Writing hyperparameters...")
         write_int(f, config["image_size"])
@@ -191,22 +185,22 @@ def main():
         write_int(f, config["num_groups"])
         write_int(f, config["initial_pad"])
         write_bool(f, True) # use_scale_shift_norm
-        
+
         # 2. Export Layers
         print("\nExporting Time MLP...")
         export_linear(f, model.time_mlp[1])
         export_linear(f, model.time_mlp[3])
-        
+
         print("\nExporting Initial Convolution...")
         export_conv(f, model.init_conv)
-        
+
         print("\nExporting Downsampling Path...")
         for layer in model.downs:
             if isinstance(layer, QATResidualBlock):
                 export_res_block(f, layer)
             elif isinstance(layer, Downsample):
                 export_conv(f, layer.downsample)
-        
+
         print("\nExporting Middle Path...")
         for layer in model.mid:
              if isinstance(layer, QATResidualBlock):
@@ -218,7 +212,7 @@ def main():
                 export_res_block(f, layer)
             elif isinstance(layer, Upsample):
                 export_conv(f, layer.upsample[1])
-        
+
         print("\nExporting Final Layers...")
         export_norm(f, model.out_norm)
         export_conv(f, model.out_conv)

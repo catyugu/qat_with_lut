@@ -356,17 +356,16 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     size_t W_out = (W_in + 2 * PW - KW) / SW + 1;
 
     Tensor output({B, C_out, H_out, W_out});
-    
-    // --- ACCELERATION: Perform convolution with additions/subtractions ---
+
     size_t C_in_per_group = C_in / G;
-    
+
     for (size_t b = 0; b < B; ++b) {
         for (size_t g = 0; g < G; ++g) {
             for (size_t c_out_g = 0; c_out_g < C_out / G; ++c_out_g) {
                 size_t c_out = g * (C_out / G) + c_out_g;
                 for (size_t h_out = 0; h_out < H_out; ++h_out) {
                     for (size_t w_out = 0; w_out < W_out; ++w_out) {
-                        float acc = 0.0f; // Accumulator for additions/subtractions
+                        float acc = 0.0f;
                         for (size_t c_in_g = 0; c_in_g < C_in_per_group; ++c_in_g) {
                             size_t c_in = g * C_in_per_group + c_in_g;
                             for (size_t kh = 0; kh < KH; ++kh) {
@@ -374,25 +373,20 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
                                     int h_in_idx = h_out * SH - PH + kh;
                                     int w_in_idx = w_out * SW - PW + kw;
                                     if (h_in_idx >= 0 && h_in_idx < H_in && w_in_idx >= 0 && w_in_idx < W_in) {
-                                        // Get the packed ternary weight (-1, 0, or 1)
                                         int8_t packed_w = static_cast<int8_t>(layer.packed_weights.at(
                                             c_out * (C_in_per_group * KH * KW) +
                                             c_in_g * (KH * KW) +
                                             kh * KW + kw
                                         ));
-                                        
-                                        // Replace multiplication with conditional add/sub
                                         if (packed_w == 1) {
                                             acc += input.at({b, c_in, (size_t)h_in_idx, (size_t)w_in_idx});
                                         } else if (packed_w == -1) {
                                             acc -= input.at({b, c_in, (size_t)h_in_idx, (size_t)w_in_idx});
                                         }
-                                        // If packed_w is 0, do nothing.
                                     }
                                 }
                             }
                         }
-                        // Apply the scaling factor and bias ONCE after all additions/subtractions
                         output.at({b, c_out, h_out, w_out}) = acc * layer.weight_scale + layer.bias[c_out];
                     }
                 }

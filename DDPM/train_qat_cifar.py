@@ -1,4 +1,4 @@
-# DDPM/train_qat_progressive.py
+# DDPM/train_qat_cifar.py
 # Final robust training script using Progressive Quantization.
 
 import os
@@ -18,18 +18,18 @@ from ddpm.script_utils_qat import get_transform, cycle
 
 def main():
     parser = argparse.ArgumentParser(description="Robust QAT Training Script")
-    
+
     # Paths
     parser.add_argument("--dataset_path", type=str, default="./data", help="Path to CIFAR-10 dataset")
     parser.add_argument("--save_path", type=str, default="./qat_unet_progressive.pth", help="Path to save the trained model")
     parser.add_argument("--sample_dir", type=str, default="./samples", help="Directory to save generated samples")
     # Training Hyperparameters
-    parser.add_argument("--device", type=str, default="cuda:2" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda:3" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--total_train_steps", type=int, default=60000, help="Total steps.")
     parser.add_argument("--sample_interval", type=int, default=1000, help="Frequency of saving sample images.")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+
     # Diffusion Hyperparameters
     parser.add_argument("--num_timesteps", type=int, default=1000)
 
@@ -41,25 +41,25 @@ def main():
     parser.add_argument("--norm", type=str, default="gn")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--attention_resolutions", type=str, default="1", help="Resolutions for attention blocks")
-    
+
     args = parser.parse_args()
-    
+
     args.channel_mults = tuple(map(int, args.channel_mults.split(',')))
     args.attention_resolutions = tuple(map(int, args.attention_resolutions.split(',')))
 
     print("="*40)
-    print("Starting Progressive Quantization Training")
+    print("Starting Quantization Training")
     print("="*40)
 
     dataset = torchvision.datasets.CIFAR10(
         root=args.dataset_path, train=True, download=True, transform=get_transform()
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    
+
     model = QATUNet(
         img_channels=3, base_channels=args.base_channels, channel_mults=args.channel_mults,
         num_res_blocks=args.num_res_blocks, time_emb_dim=args.time_emb_dim, time_emb_scale=1.0,
-        num_classes=None, dropout=args.dropout, attention_resolutions=args.attention_resolutions,
+        num_classes=10, dropout=args.dropout, attention_resolutions=args.attention_resolutions,
         norm=args.norm, num_groups=32, initial_pad=0,
     ).to(args.device)
 
@@ -67,20 +67,20 @@ def main():
     model.set_quantize_weights(True)
     model.set_quantize_activations(True)
     betas = generate_linear_schedule(args.num_timesteps, low=1e-4, high=0.02)
-    diffusion = GaussianDiffusion(model, (32, 32), 3, betas=betas, loss_type="l2",num_classes=10).to(args.device)
+    diffusion = GaussianDiffusion(model, (32, 32), 3, 10, betas=betas, loss_type="l2").to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.total_train_steps)
 
     pbar = tqdm(range(args.total_train_steps))
     data_iter = cycle(dataloader)
-    
+
     for i in pbar:
 
         optimizer.zero_grad()
         x, y = next(data_iter)
         x = x.to(args.device)
         y = y.to(args.device)
-        
+
         loss = diffusion(x,y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

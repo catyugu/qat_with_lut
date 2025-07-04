@@ -18,7 +18,7 @@ class ScaledWeightTernary(torch.autograd.Function):
     def forward(ctx, weight):
         alpha = torch.mean(torch.abs(weight)).detach()
         threshold = 0.001 * alpha
-        quantized_weight = torch.where(weight > threshold, 1.0, 
+        quantized_weight = torch.where(weight > threshold, 1.0,
                                        torch.where(weight < -threshold, -1.0, 0.0))
         scaled_quantized_weight = alpha * quantized_weight
         ctx.save_for_backward(weight)
@@ -28,7 +28,7 @@ class ScaledWeightTernary(torch.autograd.Function):
     def backward(ctx, grad_output):
         weight, = ctx.saved_tensors
         grad_weight = grad_output.clone()
-        grad_weight[weight.abs() > 1.0] = 0 
+        grad_weight[weight.abs() > 1.0] = 0
         return grad_weight
 
 class ScaledActivationTernary(torch.autograd.Function):
@@ -40,7 +40,7 @@ class ScaledActivationTernary(torch.autograd.Function):
     def forward(ctx, x):
         alpha = torch.mean(torch.abs(x)).detach()
         threshold = 0.001 * alpha
-        quantized_x = torch.where(x > threshold, 1.0, 
+        quantized_x = torch.where(x > threshold, 1.0,
                                   torch.where(x < -threshold, -1.0, 0.0))
         scaled_quantized_x = alpha * quantized_x
         ctx.save_for_backward(x)
@@ -61,7 +61,7 @@ class QATConv2d(nn.Conv2d):
     def forward(self, x):
         if self.quantize_weights:
             quantized_weight = ScaledWeightTernary.apply(self.weight)
-            return F.conv2d(self, x, quantized_weight, self.bias)
+            return F.conv2d(x, quantized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
         else:
             return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
@@ -107,7 +107,6 @@ class Upsample(nn.Module):
 
     def forward(self, x, time_emb, y):
         return self.upsample(x)
-
 class HadamardTransform(nn.Module):
     """
     Applies a Hadamard transform to the input tensor along the last dimension.
@@ -121,7 +120,7 @@ class HadamardTransform(nn.Module):
         self.dim = dim
         # Calculate the next power of 2 for padding
         self.target_dim = 2**math.ceil(math.log2(dim)) if dim > 0 else 0
-        
+
         if self.target_dim == 0:
             self.hadamard_matrix = None
         else:
@@ -142,8 +141,8 @@ class HadamardTransform(nn.Module):
     def forward(self, x):
         if self.hadamard_matrix is None:
             # If dim is 0 or invalid, return original or handle error
-            return x 
-        
+            return x
+
         original_shape = x.shape # (B, C, H, W)
         # Reshape to (Batch*H*W, Channels) for matrix multiplication
         # We want to apply Hadamard along the channel dimension (dim=1 in original x)
@@ -158,17 +157,17 @@ class HadamardTransform(nn.Module):
 
         # Move Hadamard matrix to the correct device
         hadamard_matrix_on_device = self.hadamard_matrix.to(x.device)
-        
+
         # Apply Hadamard transform (matrix multiplication)
         transformed_x = torch.matmul(x_padded, hadamard_matrix_on_device)
 
         # Unpad if necessary
         if self.dim < self.target_dim:
             transformed_x = transformed_x[:, :self.dim] # Slice back to original dimension
-        
+
         # Reshape back to (B, C, H, W)
         transformed_x = transformed_x.reshape(original_shape[0], original_shape[2], original_shape[3], original_shape[1]).permute(0, 3, 1, 2)
-        
+
         return transformed_x
 
 
@@ -180,7 +179,6 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
         # CHANGED: Use QATConv2d for quantized linear layers
         self.to_qkv = QATConv2d(in_channels, in_channels * 3, 1)
         self.to_out = QATConv2d(in_channels, in_channels, 1)
-
         # Initialize Hadamard transforms for Q, K, V
         self.hadamard_q = HadamardTransform(in_channels)
         self.hadamard_k = HadamardTransform(in_channels)
@@ -191,7 +189,7 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
         b, c, h, w = x.shape
         # Project to Q, K, V using quantized convolutions
         q, k, v = torch.split(self.to_qkv(self.norm(x)), self.in_channels, dim=1)
-        
+
         # Apply Hadamard Transform to Q, K, V (operates on float outputs of QATConv2d)
         q = self.hadamard_q(q)
         k = self.hadamard_k(k)
@@ -201,15 +199,16 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
         q = q.permute(0, 2, 3, 1).view(b, h * w, c)
         k = k.view(b, c, h * w)
         v = v.permute(0, 2, 3, 1).view(b, h * w, c)
-        
+
         # Scaled Dot-Product Attention (full precision)
         dot_products = torch.bmm(q, k) * (c ** (-0.5))
         attention = torch.softmax(dot_products, dim=-1)
         out = torch.bmm(attention, v)
-        
+
         # Reshape back and final projection using quantized convolution
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
         return self.to_out(out) + x
+
 
 class QATResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout, time_emb_dim, num_classes, norm, num_groups, use_attention):
@@ -217,7 +216,6 @@ class QATResidualBlock(nn.Module):
         self.quantize_activations = True
         self.full_precision_activation = nn.SiLU()
         self.time_activation = nn.SiLU()
-        
         self.norm_1 = get_norm(norm, in_channels, num_groups)
         self.conv_1 = QATConv2d(in_channels, out_channels, 3, padding=1)
         self.norm_2 = get_norm(norm, out_channels, num_groups)
@@ -229,28 +227,28 @@ class QATResidualBlock(nn.Module):
 
     def forward(self, x, time_emb=None, y=None):
         h = self.norm_1(x)
-        
+
         if self.quantize_activations and self.training:
             h = ScaledActivationTernary.apply(h)
         else:
             h = self.full_precision_activation(h)
-            
+
         h = self.conv_1(h)
-        
+
         if self.time_bias is not None:
             h += self.time_bias(self.time_activation(time_emb))[:, :, None, None]
         if self.class_bias is not None:
             h += self.class_bias(y)[:, :, None, None]
-            
+
         h2 = self.norm_2(h)
-        
+
         if self.quantize_activations and self.training:
             h2 = ScaledActivationTernary.apply(h2)
         else:
             h2 = self.full_precision_activation(h2)
-            
+
         h2 = self.conv_2(h2)
-        
+
         return self.attention(h2 + self.residual_connection(x))
 
 class QATUNet(nn.Module):
@@ -267,7 +265,6 @@ class QATUNet(nn.Module):
         self.ups = nn.ModuleList()
         channels = [base_channels]
         now_channels = base_channels
-        
         for i, mult in enumerate(channel_mults):
             out_channels = base_channels * mult
             for _ in range(num_res_blocks):
@@ -278,21 +275,22 @@ class QATUNet(nn.Module):
             if i != len(channel_mults) - 1:
                 self.downs.append(Downsample(now_channels))
                 channels.append(now_channels)
-        
+
         self.mid = nn.ModuleList([
             QATResidualBlock(now_channels, now_channels, dropout, time_emb_dim, num_classes, norm, num_groups, True),
             QATResidualBlock(now_channels, now_channels, dropout, time_emb_dim, num_classes, norm, num_groups, False),
         ])
-        
+
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_channels = base_channels * mult
             for _ in range(num_res_blocks + 1):
                 use_attention = (now_channels in attention_resolutions)
+                # Corrected the instantiation of QATResidualBlock
                 self.ups.append(QATResidualBlock(channels.pop() + now_channels, out_channels, dropout, time_emb_dim, num_classes, norm, num_groups, use_attention))
                 now_channels = out_channels
             if i != 0:
                 self.ups.append(Upsample(now_channels))
-        
+
         self.out_norm = get_norm(norm, base_channels, num_groups)
         self.out_activation = nn.SiLU()
         self.out_conv = QATConv2d(base_channels, img_channels, 3, padding=1)
@@ -321,7 +319,7 @@ class QATUNet(nn.Module):
         for module in self.modules():
             if isinstance(module, QATConv2d):
                 module.quantize_weights = enabled
-    
+
     def set_quantize_activations(self, enabled: bool):
         for module in self.modules():
             if isinstance(module, QATResidualBlock):
