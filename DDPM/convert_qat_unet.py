@@ -138,7 +138,7 @@ def main():
         "initial_pad": 0
     }
 
-    model_path = "qat_unet_progressive.pth"
+    model_path = "qat_unet_final.pth"
     output_path = "qat_unet_model.bin"
 
     model_init_config = {
