@@ -23,6 +23,7 @@ add_executable(myQATModel
         src/types.cpp
         src/utils.cpp
         src/kernels.cpp
+        src/profiler.cpp
 )
 
 target_include_directories(myQATModel PUBLIC include)
@@ -39,6 +40,7 @@ add_executable(speed_test
         src/types.cpp
         src/utils.cpp
         src/kernels.cpp
+        src/profiler.cpp
 )
 add_executable(generate_image 
         src/generate_image.cpp
@@ -46,6 +48,7 @@ add_executable(generate_image
         src/kernels.cpp 
         src/types.cpp
         src/utils.cpp
+        src/profiler.cpp
         )
 target_include_directories(speed_test PUBLIC include)
 target_include_directories(generate_image PUBLIC include)
@@ -54,12 +57,15 @@ target_link_libraries(speed_test PRIVATE
         Threads::Threads
         OpenMP::OpenMP_CXX
 )
-
+target_link_libraries(generate_image PRIVATE
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(myQATModel PRIVATE -mavx2 -O3 )
-    target_compile_options(speed_test PRIVATE -mavx2 -O3)
-    target_compile_options(generate_image PRIVATE -mavx2 -O3 )
+    target_compile_options(myQATModel PRIVATE -mavx2 -Ofast )
+    target_compile_options(speed_test PRIVATE -mavx2 -Ofast)
+    target_compile_options(generate_image PRIVATE -mavx2 -Ofast )
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
     target_compile_options(myQATModel PRIVATE /arch:AVX2)
     target_compile_options(speed_test PRIVATE /arch:AVX2)

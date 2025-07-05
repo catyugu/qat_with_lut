@@ -7,7 +7,7 @@
 #include "qat_unet_model.h"
 #include "utils.h"
 #include "kernels.h" // Include the kernel declarations
-
+#include "profiler.h" // Include the profiler headern
 // #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -85,6 +85,7 @@ int main(int argc, char* argv[]) {
 
         // 4. The Denoising Loop
         std::cout << "Starting denoising loop for " << diffusion_steps << " steps..." << std::endl;
+        Profiler::getInstance().reset(); // <-- 在循环前重置计时器
         for (int t = diffusion_steps - 1; t >= 0; --t) {
             std::cout << "Step " << t << "..." << std::endl;
             
@@ -114,6 +115,7 @@ int main(int argc, char* argv[]) {
                 image_tensor = image_tensor.add(noise_tensor.mul_scalar(noise_scale));
             }
         }
+        Profiler::getInstance().report();
         std::cout << "Denoising complete." << std::endl;
 
         // 6. Convert final tensor to image and save

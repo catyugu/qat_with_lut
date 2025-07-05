@@ -1,16 +1,16 @@
 #include "kernels.h" // Include the corresponding header
 
 #include <immintrin.h>
-
 #include "types.h"   // Include types.h for struct definitions
 #include "utils.h"   // Include utils.h for functions like convert_int8_to_ternary_activation, pack_ternary_activations_5x3bit etc.
-
+#include "profiler.h" // <-- 包含头文件
 #include <iostream> // For debugging, remove in final build
 #include <cmath>
 #include <vector>
 #include <numeric>
 #include <stdexcept>
 #include <limits> // Required for std::numeric_limits
+
 
 // --- SIMD 核心内核实现 ---
 
@@ -346,6 +346,7 @@ Tensor softmax(const Tensor& input) {
 // --- Layer Kernels ---
 
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
+    PROFILE_SCOPE("conv2d"); // <-- 2. 在函数开头添加宏
     const auto& in_shape = input.shape;
     size_t B = in_shape[0], C_in = in_shape[1], H_in = in_shape[2], W_in = in_shape[3];
     size_t C_out = layer.out_channels, KH = layer.kernel_size_h, KW = layer.kernel_size_w;
@@ -398,6 +399,7 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
 
 
 Tensor linear(const Tensor& input, const LinearLayer& layer) {
+    PROFILE_SCOPE("linear"); // <-- 添加宏
     const auto& in_shape = input.shape;
     size_t B = (in_shape.size() > 1) ? in_shape[0] : 1;
     size_t in_features = in_shape.back();
@@ -420,6 +422,7 @@ Tensor linear(const Tensor& input, const LinearLayer& layer) {
 }
 
 Tensor group_norm(const Tensor& input, const GroupNormLayer& layer) {
+    PROFILE_SCOPE("group_norm");
     const auto& shape = input.shape;
     size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
     size_t G = layer.num_groups, C_per_group = C / G;
@@ -465,6 +468,7 @@ Tensor group_norm(const Tensor& input, const GroupNormLayer& layer) {
 }
 
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
+    PROFILE_SCOPE("attention_block");
     const auto& shape = input.shape;
     size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
 
@@ -496,6 +500,7 @@ Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
 }
 
 Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block) {
+    PROFILE_SCOPE("residual_block");
     Tensor h = group_norm(input, *block.norm_1);
     h = silu(h);
     h = conv2d(h, *block.conv_1);
@@ -547,6 +552,7 @@ Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer
 // --- Main Model Forward Pass ---
 
 Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor& time) {
+    PROFILE_SCOPE("forward_qat_unet"); 
     Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear1);
     time_emb = silu(time_emb);
