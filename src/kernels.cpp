@@ -273,35 +273,54 @@ void standard_linear_forward(
     }
 }
 
-void im2col(const std::vector<float>& input, int channels, int height, int width,
-            int kernel_h, int kernel_w, int stride_h, int stride_w,
-            int pad_h, int pad_w, std::vector<float>& col) {
+void im2col(float* data_col, const float* data_im,
+            int B, int C_in, int H_in, int W_in,
+            int KH, int KW, int pad, int stride) {
 
-    int output_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    int output_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    int col_rows = channels * kernel_h * kernel_w;
-    int col_cols = output_h * output_w;
+    // 1. 根据卷积参数计算输出特征图的尺寸
+    const int H_out = (H_in + 2 * pad - KH) / stride + 1;
+    const int W_out = (W_in + 2 * pad - KW) / stride + 1;
 
-    col.assign(col_rows * col_cols, 0.0f);
+    // 2. 预计算输出矩阵的维度，用于索引计算
+    // 输出矩阵的行数 K = C_in * KH * KW (一个 patch 拉平后的长度)
+    const int K = C_in * KH * KW;
+    // 输出矩阵的列数 N = B * H_out * W_out (所有 patch 的总数)
+    const int N = B * H_out * W_out;
 
-    for (int c = 0; c < channels; ++c) {
-        for (int kh = 0; kh < kernel_h; ++kh) {
-            for (int kw = 0; kw < kernel_w; ++kw) {
-                int input_row = -pad_h + kh;
-                for (int oh = 0; oh < output_h; ++oh) {
-                    int input_col = -pad_w + kw;
-                    for (int ow = 0; ow < output_w; ++ow) {
-                        int col_index = (c * kernel_h * kernel_w + kh * kernel_w + kw) * (output_h * output_w) + oh * output_w + ow;
-                        int input_h_idx = input_row + oh * stride_h;
-                        int input_w_idx = input_col + ow * stride_w;
+    // 3. 核心循环：填充输出矩阵 data_col
+    // 外层循环遍历输出矩阵的每一行 (由 c, kh, kw 唯一确定)
+    for (int k = 0; k < K; ++k) {
+        // 从一维索引 k 中分解出通道、卷积核高和宽的索引
+        const int kw = k % KW;
+        const int kh = (k / KW) % KH;
+        const int c = k / (KW * KH);
 
-                        if (input_h_idx >= 0 && input_h_idx < height && input_w_idx >= 0 && input_w_idx < width) {
-                            col[col_index] = input[c * width * height + input_h_idx * width + input_w_idx];
-                        } else {
-                            col[col_index] = 0; // Padding
-                        }
-                    }
-                }
+        // 内层循环遍历输出矩阵的每一列 (由 b, h_out, w_out 唯一确定)
+        for (int n = 0; n < N; ++n) {
+            // 从一维索引 n 中分解出批次、输出高和宽的索引
+            const int w_out = n % W_out;
+            const int h_out = (n / W_out) % H_out;
+            const int b = n / (W_out * H_out);
+
+            // 4. 计算当前 patch 元素在原始输入图像中的坐标
+            const int h_in = h_out * stride - pad + kh;
+            const int w_in = w_out * stride - pad + kw;
+
+            // 5. 计算在输入和输出一维数组中的索引
+            // 使用 long long 防止大尺寸时整数溢出
+            const long long col_idx = (long long)k * N + n;
+            const long long im_idx = (long long)b * C_in * H_in * W_in +
+                                     (long long)c * H_in * W_in +
+                                     (long long)h_in * W_in + w_in;
+
+            // 6. 边界检查与数据填充
+            // 检查计算出的输入坐标是否在原始图像的有效范围内 (不包括填充)
+            if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                // 如果是有效位置，从输入图像复制数据
+                data_col[col_idx] = data_im[im_idx];
+            } else {
+                // 如果是在填充区域 (padding)，则用 0 填充
+                data_col[col_idx] = 0.0f;
             }
         }
     }
@@ -345,59 +364,140 @@ Tensor softmax(const Tensor& input) {
 
 // --- Layer Kernels ---
 
+std::vector<float> unpack_ternary_weights(const std::vector<uint8_t>& packed_weights, size_t num_weights) {
+    std::vector<float> unpacked(num_weights);
+    size_t unpacked_idx = 0;
+
+    for (uint8_t byte : packed_weights) {
+        for (int i = 0; i < 4; ++i) {
+            if (unpacked_idx >= num_weights) break;
+
+            // 从低位到高位依次提取 2-bit
+            uint8_t two_bits = (byte >> (i * 2)) & 0x03;
+
+            switch (two_bits) {
+                case 0b00: unpacked[unpacked_idx++] = 0.0f; break;
+                case 0b01: unpacked[unpacked_idx++] = 1.0f; break;
+                case 0b10: unpacked[unpacked_idx++] = -1.0f; break;
+                // case 0b11: // 11 是保留位，可以报错或设为默认值
+                default:   unpacked[unpacked_idx++] = 0.0f; break; // 默认为0
+            }
+        }
+    }
+    return unpacked;
+}
+
+
+// 保留之前实现的 AVX2 优化的三值 GEMM 函数
+void ternary_gemm_avx2(int M, int N, int K, const float* A, const float* B, float* C) {
+    // ... (此函数无需修改，与上一版完全相同) ...
+    constexpr int AVX_FLOAT_COUNT = 8;
+    for (int i = 0; i < M; ++i) {
+        int j = 0;
+        for (; j + AVX_FLOAT_COUNT <= N; j += AVX_FLOAT_COUNT) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int k = 0; k < K; ++k) {
+                const float weight_val = A[i * K + k];
+                if (weight_val == 0.0f) continue;
+                __m256 b_vals = _mm256_loadu_ps(&B[k * N + j]);
+                if (weight_val == 1.0f) {
+                    acc = _mm256_add_ps(acc, b_vals);
+                } else {
+                    acc = _mm256_sub_ps(acc, b_vals);
+                }
+            }
+            _mm256_storeu_ps(&C[i * N + j], acc);
+        }
+        for (; j < N; ++j) {
+            float acc_scalar = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const float weight_val = A[i * K + k];
+                if (weight_val == 0.0f) continue;
+                const float b_val = B[k * N + j];
+                if (weight_val == 1.0f) acc_scalar += b_val;
+                else acc_scalar -= b_val;
+            }
+            C[i * N + j] = acc_scalar;
+        }
+    }
+}
+
+
+/**
+ * @brief 最终优化的卷积函数，接口与您的结构体完全匹配
+ */
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
-    PROFILE_SCOPE("conv2d"); // <-- 2. 在函数开头添加宏
-    const auto& in_shape = input.shape;
-    size_t B = in_shape[0], C_in = in_shape[1], H_in = in_shape[2], W_in = in_shape[3];
-    size_t C_out = layer.out_channels, KH = layer.kernel_size_h, KW = layer.kernel_size_w;
-    size_t SH = layer.stride_h, SW = layer.stride_w, PH = layer.pad_h, PW = layer.pad_w;
-    size_t G = layer.groups;
+    // 基本参数检查
+    if (layer.groups != 1) {
+        throw std::runtime_error("Optimized conv2d currently only supports groups=1");
+    }
 
-    size_t H_out = (H_in + 2 * PH - KH) / SH + 1;
-    size_t W_out = (W_in + 2 * PW - KW) / SW + 1;
+    // 使用 const auto& 是一种好习惯
+    const auto& input_shape = input.shape;
+    const int B = input_shape[0];
+    const int C_in = input_shape[1];
+    const int H_in = input_shape[2];
+    const int W_in = input_shape[3];
 
-    Tensor output({B, C_out, H_out, W_out});
+    // 从 layer 结构体中获取参数
+    const int C_out = layer.out_channels;
+    const int KH = layer.kernel_size_h;
+    const int KW = layer.kernel_size_w;
+    const int stride = layer.stride_h;
+    const int padding = layer.pad_h;
 
-    size_t C_in_per_group = C_in / G;
+    // 1. 解包权重
+    const size_t num_weights = C_out * C_in * KH * KW;
+    std::vector<float> unpacked_weights = unpack_ternary_weights(layer.packed_weights, num_weights);
 
-    for (size_t b = 0; b < B; ++b) {
-        for (size_t g = 0; g < G; ++g) {
-            for (size_t c_out_g = 0; c_out_g < C_out / G; ++c_out_g) {
-                size_t c_out = g * (C_out / G) + c_out_g;
-                for (size_t h_out = 0; h_out < H_out; ++h_out) {
-                    for (size_t w_out = 0; w_out < W_out; ++w_out) {
-                        float acc = 0.0f;
-                        for (size_t c_in_g = 0; c_in_g < C_in_per_group; ++c_in_g) {
-                            size_t c_in = g * C_in_per_group + c_in_g;
-                            for (size_t kh = 0; kh < KH; ++kh) {
-                                for (size_t kw = 0; kw < KW; ++kw) {
-                                    int h_in_idx = h_out * SH - PH + kh;
-                                    int w_in_idx = w_out * SW - PW + kw;
-                                    if (h_in_idx >= 0 && h_in_idx < H_in && w_in_idx >= 0 && w_in_idx < W_in) {
-                                        int8_t packed_w = static_cast<int8_t>(layer.packed_weights.at(
-                                            c_out * (C_in_per_group * KH * KW) +
-                                            c_in_g * (KH * KW) +
-                                            kh * KW + kw
-                                        ));
-                                        if (packed_w == 1) {
-                                            acc += input.at({b, c_in, (size_t)h_in_idx, (size_t)w_in_idx});
-                                        } else if (packed_w == -1) {
-                                            acc -= input.at({b, c_in, (size_t)h_in_idx, (size_t)w_in_idx});
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        output.at({b, c_out, h_out, w_out}) = acc * layer.weight_scale + layer.bias[c_out];
-                    }
+    // 2. 计算输出尺寸并创建输出 Tensor
+    const int H_out = (H_in + 2 * padding - KH) / stride + 1;
+    const int W_out = (W_in + 2 * padding - KW) / stride + 1;
+
+    // --- FIX START ---
+    // 修复 narrowing conversion 警告和类型不匹配问题
+    // 将 int 显式转换为 size_t (或 long unsigned int) 来匹配 Tensor.shape 的类型
+    Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
+    // --- FIX END ---
+
+
+    // 3. im2col 转换
+    Tensor col_buffer;
+    // --- FIX START ---
+    // 修复 operator= 错误
+    // 将 col_shape 的类型从 std::vector<int> 改为和 Tensor.shape 匹配的类型
+    const std::vector<size_t> col_shape = {(size_t)(C_in * KH * KW), (size_t)(B * H_out * W_out)};
+    // --- FIX END ---
+    col_buffer.shape = col_shape;
+    col_buffer.data.resize(col_shape[0] * col_shape[1]);
+    im2col(col_buffer.data.data(), input.data.data(), B, C_in, H_in, W_in, KH, KW, padding, stride);
+
+    // 4. 调用 AVX2 GEMM 进行核心计算
+    const int M = C_out;
+    const int N = B * H_out * W_out;
+    const int K = C_in * KH * KW;
+    ternary_gemm_avx2(M, N, K, unpacked_weights.data(), col_buffer.data.data(), output.data.data());
+
+    // 5. 添加偏置
+    if (!layer.bias.empty()) {
+        for (int b = 0; b < B; ++b) {
+            for (int c = 0; c < C_out; ++c) {
+                float* out_ptr_base = &output.data[(b * C_out + c) * (H_out * W_out)];
+                __m256 bias_vec = _mm256_set1_ps(layer.bias[c]);
+                int i = 0;
+                for (; i + 8 <= H_out * W_out; i += 8) {
+                    float* out_ptr = out_ptr_base + i;
+                    _mm256_storeu_ps(out_ptr, _mm256_add_ps(_mm256_loadu_ps(out_ptr), bias_vec));
+                }
+                for (; i < H_out * W_out; ++i) {
+                    out_ptr_base[i] += layer.bias[c];
                 }
             }
         }
     }
+
     return output;
 }
-
-
 Tensor linear(const Tensor& input, const LinearLayer& layer) {
     PROFILE_SCOPE("linear"); // <-- 添加宏
     const auto& in_shape = input.shape;
