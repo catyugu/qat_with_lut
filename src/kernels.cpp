@@ -693,3 +693,88 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
 
     return h;
 }
+// --- Main UNet Forward Pass ---
+// --- Residual Block ---
+Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block, const Tensor& y) {
+    Tensor h = input;
+
+    // First normalization and convolution
+    h = group_norm(h, *block.norm_1);
+    h = silu(h);
+    h = conv2d(h, *block.conv_1);
+
+    // Add time and class embeddings
+    if (block.time_bias) {
+        Tensor time_bias = linear(time_emb, *block.time_bias);
+        h = h.add(time_bias.view({h.shape[0], h.shape[1], 1, 1})); // 修正：使用view
+    }
+
+    if (block.class_bias) {
+        int class_idx = static_cast<int>(y.data[0]);
+        int embedding_dim = block.class_bias->embedding_dim;
+        Tensor class_bias_tensor({1, (size_t)embedding_dim}); 
+        
+        const auto& weights = block.class_bias->weight;
+        std::copy(weights.begin() + class_idx * embedding_dim,
+                  weights.begin() + (class_idx + 1) * embedding_dim,
+                  class_bias_tensor.data.begin());
+
+        h = h.add(class_bias_tensor.view({h.shape[0], h.shape[1], 1, 1})); // 修正：使用view
+    }
+
+    // Second normalization and convolution
+    h = group_norm(h, *block.norm_2);
+    h = silu(h);
+    h = conv2d(h, *block.conv_2);
+
+    // Add residual connection
+    if (block.residual_connection) {
+        return h.add(conv2d(input, *block.residual_connection));
+    }
+    return h.add(input);
+}
+
+
+Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor& time, const Tensor& y) {
+    PROFILE_SCOPE("forward_qat_unet"); 
+    Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
+    time_emb = linear(time_emb, *model.time_mlp_linear1);
+    time_emb = silu(time_emb);
+    time_emb = linear(time_emb, *model.time_mlp_linear2);
+
+    Tensor h = conv2d(x, *model.init_conv);
+    
+    std::vector<Tensor> skips;
+    skips.push_back(h);
+
+    for (const auto& layer_ptr : model.downs) {
+        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            h = residual_block(h, time_emb, *res_block,y);
+        } else if (auto* downsample_block = dynamic_cast<DownsampleLayer*>(layer_ptr.get())) {
+            h = conv2d(h, *downsample_block->conv);
+        }
+        skips.push_back(h);
+    }
+
+    h = residual_block(h, time_emb, *model.middle_block1, y);
+    h = residual_block(h, time_emb, *model.middle_block2, y);
+
+    for (const auto& layer_ptr : model.ups) {
+        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            Tensor skip = skips.back();
+            skips.pop_back();
+            h = h.cat(skip, 1); 
+            h = residual_block(h, time_emb, *res_block,y);
+        } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
+            h = h.upsample(2);
+            h = conv2d(h, *upsample_block->conv);
+        }
+    }
+    
+    h = group_norm(h, *model.final_norm);
+    h = silu(h);
+    h = conv2d(h, *model.final_conv);
+
+    return h;
+}
+

@@ -92,14 +92,32 @@ void QATUNetModel::read_res_block(std::ifstream& file, QATResidualBlock& block) 
     std::cout << " Reading QATResidualBlock..." << std::endl;
     read_norm_layer(file, *block.norm_1);
     read_conv_layer(file, *block.conv_1);
-    if (block.time_bias) {
+    bool has_time_bias;
+    read_from_file(file, has_time_bias, "res_block.has_time_bias");
+    if (has_time_bias) {
+        block.time_bias = std::make_unique<LinearLayer>();
         read_linear_layer(file, *block.time_bias);
+    }
+    bool has_class_bias;
+    read_from_file(file, has_class_bias, "res_block.has_class_bias");
+    if (has_class_bias) {
+        block.class_bias = std::make_unique<Embedding>();
+        read_from_file(file, block.class_bias->num_embeddings, "class_bias.num_embeddings");
+        read_from_file(file, block.class_bias->embedding_dim, "class_bias.embedding_dim");
+        int weight_size;
+        read_from_file(file, weight_size, "class_bias.weight_size");
+        block.class_bias->weight.resize(weight_size);
+        read_vector(file, block.class_bias->weight, "class_bias.weight");
     }
     read_norm_layer(file, *block.norm_2);
     read_conv_layer(file, *block.conv_2);
+    bool has_residual_connection;
+    read_from_file(file, has_residual_connection, "res_block.has_residual_connection");
     if (block.residual_connection) {
         read_conv_layer(file, *block.residual_connection);
     }
+    bool has_attention;
+    read_from_file(file, has_attention, "res_block.has_attention");
     if (block.attention) {
         read_attention_block(file, *block.attention);
     }

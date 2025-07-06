@@ -86,6 +86,13 @@ def export_linear(f, layer):
     write_int(f, bias.numel())
     write_tensor(f, bias)
 
+def export_embedding(f, layer):
+    """Exports an nn.Embedding layer."""
+    print(f"  Exporting Embedding: num_embeddings={layer.num_embeddings}, embedding_dim={layer.embedding_dim}")
+    write_int(f, layer.num_embeddings)
+    write_int(f, layer.embedding_dim)
+    write_int(f, layer.weight.numel())
+    write_tensor(f, layer.weight)
 
 def export_norm(f, layer):
     """Exports a GroupNorm layer."""
@@ -106,17 +113,37 @@ def export_attention_block(f, block):
     export_conv(f, block.to_out)
 
 def export_res_block(f, block):
-    """Exports a QATResidualBlock based on the provided definition."""
+    """Exports a QATResidualBlock with flags for optional layers."""
     print("Exporting QATResidualBlock...")
     export_norm(f, block.norm_1)
     export_conv(f, block.conv_1)
-    if block.time_bias is not None:
+
+    # Export time_bias if it exists
+    has_time_bias = block.time_bias is not None
+    write_bool(f, has_time_bias)
+    if has_time_bias:
         export_linear(f, block.time_bias)
+
+    # --- NEW: Export class_bias if it exists ---
+    has_class_bias = block.class_bias is not None
+    write_bool(f, has_class_bias)
+    if has_class_bias:
+        export_embedding(f, block.class_bias)
+    # -----------------------------------------
+
     export_norm(f, block.norm_2)
     export_conv(f, block.conv_2[1]) # Access the QATConv2d within the nn.Sequential
-    if isinstance(block.residual_connection, nn.Conv2d):
+
+    # Export residual_connection if it exists and is a Conv2d
+    is_res_conv = isinstance(block.residual_connection, nn.Conv2d)
+    write_bool(f, is_res_conv)
+    if is_res_conv:
         export_conv(f, block.residual_connection)
-    if isinstance(block.attention, AttentionBlock):
+
+    # Export attention if it exists
+    has_attention = isinstance(block.attention, AttentionBlock)
+    write_bool(f, has_attention)
+    if has_attention:
         export_attention_block(f, block.attention)
 
 # --- Main Export Logic ---

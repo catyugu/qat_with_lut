@@ -98,7 +98,9 @@ int main(int argc, char* argv[]) {
             Tensor time_tensor({1});
             time_tensor.data[0] = (float)t;
 
-            Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor);
+            Tensor class_tensor({1});
+            class_tensor.data[0] = 1.0f; // Assuming no class conditioning
+            Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor,class_tensor);
 
             // 5. Denoise the image one step (修正后的逻辑)
             float remove_coeff = dc.remove_noise_coeff[t];

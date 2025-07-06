@@ -98,7 +98,12 @@ Tensor attention_block(const Tensor& input, const AttentionBlock& block);
 
 // Performs the forward pass for a complete QATResidualBlock
 Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block);
-
+Tensor residual_block(
+    const Tensor& input,
+    const QATResidualBlock& block,
+    const Tensor& time_emb,
+    const Tensor& y // <-- 新增：类别标签张量
+);
 // --- Main Model Forward Pass ---
 
 // Orchestrates the full forward pass of the QATUNet model
@@ -106,5 +111,11 @@ Tensor forward_qat_unet(
     const QATUNetModel& model,
     const Tensor& x,
     const Tensor& time
+);
+Tensor forward_qat_unet(
+    const QATUNetModel& model,
+    const Tensor& x,
+    const Tensor& time,
+    const Tensor& y // <-- 新增：类别标签张量
 );
 #endif // KERNELS_H

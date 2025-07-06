@@ -71,11 +71,16 @@ struct AttentionBlock : public Module {
         to_out = std::make_unique<QATConv2dLayer>();
     }
 };
-
+struct Embedding {
+    int num_embeddings;
+    int embedding_dim;
+    std::vector<float> weight;
+};
 struct QATResidualBlock : public Module {
     std::unique_ptr<GroupNormLayer> norm_1;
     std::unique_ptr<QATConv2dLayer> conv_1;
     std::unique_ptr<LinearLayer> time_bias;
+    std::unique_ptr<Embedding> class_bias; 
     std::unique_ptr<GroupNormLayer> norm_2;
     std::unique_ptr<QATConv2dLayer> conv_2;
     std::unique_ptr<QATConv2dLayer> residual_connection;
@@ -127,7 +132,25 @@ struct Tensor {
         }
         data.resize(total_size);
     }
+    Tensor(const std::vector<size_t>& s) : shape(s) {
+        size_t total_size = numel();
+        if (total_size > 0) {
+            data.resize(total_size);
+        }
+    }
 
+    // --- 新增的成员函数 ---
+    // 计算并返回张量中的元素总数
+    size_t numel() const {
+        if (shape.empty()) {
+            return 0;
+        }
+        size_t total = 1;
+        for (size_t dim : shape) {
+            total *= dim;
+        }
+        return total;
+    }
     // Helper to calculate flat index from multi-dimensional indices
     size_t get_index(std::initializer_list<size_t> indices) const {
         if (indices.size() != shape.size()) {
@@ -313,6 +336,45 @@ struct Tensor {
             }
         }
         return result;
+    }
+    Tensor view(const std::vector<size_t>& new_shape) const {
+        size_t new_numel = 1;
+        for (size_t dim : new_shape) {
+            new_numel *= dim;
+        }
+        if (new_numel != this->numel()) {
+            throw std::runtime_error("View error: number of elements must match.");
+        }
+        Tensor new_tensor(new_shape);
+        new_tensor.data = this->data; // 共享数据指针
+        return new_tensor;
+    }
+    Tensor interpolate(float scale_factor) const {
+        if (shape.size() != 4) {
+            throw std::runtime_error("Interpolate only supports 4D tensors (B, C, H, W).");
+        }
+        size_t b = shape[0], c = shape[1], h = shape[2], w = shape[3];
+        size_t new_h = static_cast<size_t>(h * scale_factor);
+        size_t new_w = static_cast<size_t>(w * scale_factor);
+
+        Tensor output({b, c, new_h, new_w});
+
+        for (size_t bi = 0; bi < b; ++bi) {
+            for (size_t ci = 0; ci < c; ++ci) {
+                for (size_t hi = 0; hi < new_h; ++hi) {
+                    for (size_t wi = 0; wi < new_w; ++wi) {
+                        size_t old_h = static_cast<size_t>(hi / scale_factor);
+                        size_t old_w = static_cast<size_t>(wi / scale_factor);
+                        
+                        size_t new_idx = bi * (c * new_h * new_w) + ci * (new_h * new_w) + hi * new_w + wi;
+                        size_t old_idx = bi * (c * h * w) + ci * (h * w) + old_h * w + old_w;
+
+                        output.data[new_idx] = this->data[old_idx];
+                    }
+                }
+            }
+        }
+        return output;
     }
 };
 #endif // TYPES_H
