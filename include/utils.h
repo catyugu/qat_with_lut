@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint> // For uint8_t, int8_t, int16_t
 #include <string>  // For std::string
+#include <types.h>
 
 // Forward declarations for structs defined in types.h
 struct FloatLayer;
@@ -64,7 +65,8 @@ extern std::vector<uint8_t> g_packing_lut;
 void relu(float* vec_ptr, size_t size);
 void log_softmax(float* vec_ptr, size_t size);
 void silu(float* vec_ptr, size_t size); // Added SiLU declaration
-
+Tensor silu(const Tensor& input);
+Tensor softmax(const Tensor& input);
 // --- Data Transformation Functions ---
 // Declaration for im2col function
 void im2col(const float* data_im, int channels, int height, int width,

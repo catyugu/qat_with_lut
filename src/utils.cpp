@@ -1,11 +1,10 @@
 #include "utils.h" // Include the corresponding header
-#include "types.h" // Include types.h for struct definitions
 
 #include <algorithm> // For std::max, std::min
 #include <cmath>     // For roundf, std::exp, std::log
 #include <iostream>  // For std::cerr, std::cout (for debugging/errors in loading)
 #include <fstream>   // For std::ifstream
-
+#include <cfloat>   // For std::fabs
 // Include for image writing (define STB_IMAGE_WRITE_IMPLEMENTATION once in one .cpp file)
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -468,5 +467,52 @@ bool save_image_from_float_array(const std::string& filename, const std::vector<
 int argmax(const std::vector<float>& vec, int offset, int size) {
     if (size == 0) return -1;
     return static_cast<int>(std::distance(vec.begin() + offset, std::max_element(vec.begin() + offset, vec.begin() + offset + size)));
+}
+Tensor silu(const Tensor& input) {
+    Tensor output(input.shape);
+    const float* in_data = input.data.data();
+    float* out_data = output.data.data();
+    size_t size = input.data.size();
+    for (size_t i = 0; i < size; ++i) {
+        out_data[i] = in_data[i] / (1.0f + std::exp(-in_data[i]));
+    }
+    return output;
+}
+
+// Softmax function (numerically stable)
+// Applies softmax along the last dimension of the tensor
+Tensor softmax(const Tensor& input) {
+    Tensor output(input.shape);
+    
+    // Assuming the last dimension is the one to apply softmax over.
+    // E.g., for a shape of [B, H, W, C], softmax is over C.
+    size_t last_dim = input.shape.back();
+    size_t num_vectors = input.data.size() / last_dim;
+    for (size_t i = 0; i < num_vectors; ++i) {
+        const float* in_ptr = input.data.data() + i * last_dim;
+        float* out_ptr = output.data.data() + i * last_dim;
+
+        // 1. Find max for numerical stability
+        float max_val = -FLT_MAX;
+        for (size_t j = 0; j < last_dim; ++j) {
+            if (in_ptr[j] > max_val) {
+                max_val = in_ptr[j];
+            }
+        }
+
+        // 2. Exp and sum
+        float sum_exp = 0.0f;
+        for (size_t j = 0; j < last_dim; ++j) {
+            float val = std::exp(in_ptr[j] - max_val);
+            out_ptr[j] = val; // Store temporarily
+            sum_exp += val;
+        }
+
+        // 3. Normalize
+        for (size_t j = 0; j < last_dim; ++j) {
+            out_ptr[j] /= sum_exp;
+        }
+    }
+    return output;
 }
 

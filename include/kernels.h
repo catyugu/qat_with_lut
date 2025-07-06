@@ -77,6 +77,8 @@ void standard_linear_forward(
     int output_dim,
     int batch_size
 );
+void im2col(const Tensor& input, Tensor& col_buffer, int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w);
+void gemm(const Tensor& A, const Tensor& B, Tensor& C);
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer);
 
 // Performs a standard linear (fully connected) layer operation
