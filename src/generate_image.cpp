@@ -111,7 +111,6 @@ int main(int argc, char* argv[]) {
             Tensor class_tensor({1});
             class_tensor.data[0] = (float)class_label; 
             
-            // 模型预测噪声
             Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor, class_tensor);
 
             // **核心修正**: 完全匹配 Python 的 `remove_noise` 逻辑
@@ -121,21 +120,21 @@ int main(int argc, char* argv[]) {
 
             // 2. 计算 (x - coeff * predicted_noise)
             Tensor denoised_term = image_tensor.sub(predicted_noise.mul_scalar(remove_coeff));
-            
-            // 3. 乘以 1 / sqrt(alpha_t)
+
+            // 3. 乘以 1 / sqrt(alpha_t) 以获得去噪后的图像
             image_tensor = denoised_term.mul_scalar(recip_sqrt_alpha);
 
             // 4. 如果 t > 0，添加噪声 (匹配 Python 的 sample 逻辑)
             if (t > 0) {
                 float sigma_t = dc.sigma[t];
-                
+
                 Tensor noise_tensor({1, (size_t)model.in_channels, (size_t)model.image_size, (size_t)model.image_size});
                 for(size_t i = 0; i < noise_tensor.data.size(); ++i) {
                     noise_tensor.data[i] = dist(gen);
                 }
                 // 添加噪声: image_tensor += sigma_t * noise
                 image_tensor = image_tensor.add(noise_tensor.mul_scalar(sigma_t));
-            }
+}
         }
         Profiler::getInstance().report();
         std::cout << "Denoising complete." << std::endl;
