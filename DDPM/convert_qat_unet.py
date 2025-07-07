@@ -4,6 +4,39 @@ import struct
 import numpy as np
 from ddpm.QAT_UNet import QATUNet, QATResidualBlock, AttentionBlock, Downsample, Upsample, QATConv2d, ScaledWeightTernary
 
+# --- Helper Functions ---
+
+def pack_ternary_weights(tensor):
+    """
+    将一个三值化的权重张量 (-1, 0, 1) 打包成一个 uint32_t 列表。
+    每个权重使用2个bit: 01 for +1, 10 for -1, 00 for 0.
+    """
+    # 确保张量在CPU上并且是平铺的
+    tensor_flat = tensor.cpu().view(-1)
+    
+    packed_data = []
+    # 每 16 个权重打包成一个 uint32
+    num_chunks = (len(tensor_flat) + 15) // 16
+    
+    for i in range(num_chunks):
+        packed_uint32 = 0
+        chunk = tensor_flat[i*16 : (i+1)*16]
+        
+        for j, weight in enumerate(chunk):
+            bits = 0
+            if weight.item() == 1.0:
+                bits = 1  # 01
+            elif weight.item() == -1.0:
+                bits = 2  # 10
+            # 如果是 0，bits 保持为 00
+            
+            # 将2-bit的数据移到正确的位置并合并
+            packed_uint32 |= (bits << (j * 2))
+            
+        packed_data.append(packed_uint32)
+        
+    return packed_data
+
 # Helper functions to write data to the binary file
 def write_int(f, val):
     f.write(struct.pack('i', val))
@@ -18,14 +51,14 @@ def write_tensor(f, tensor):
     tensor_np = tensor.detach().cpu().numpy()
     f.write(tensor_np.tobytes())
 
-def write_packed_tensor(f, tensor):
-    tensor_np = tensor.detach().cpu().numpy()
-    f.write(tensor_np.tobytes())
-
 # --- Layer Export Functions ---
 
 def export_conv(f, layer):
-    """Exports a Conv2d layer, using custom ternary quantization for QATConv2d."""
+    """
+    Exports a Conv2d layer.
+    For QATConv2d, weights are ternary quantized and packed into 2-bit format.
+    For standard nn.Conv2d, weights are exported as floats.
+    """
     is_custom_qat = isinstance(layer, QATConv2d)
 
     # Write common parameters
@@ -40,31 +73,57 @@ def export_conv(f, layer):
     write_int(f, layer.groups)
 
     if is_custom_qat:
-        print(f"  Exporting Custom Ternary QAT Conv2d: in={layer.in_channels}, out={layer.out_channels}")
+        print(f"  Exporting and Packing Ternary QAT Conv2d: in={layer.in_channels}, out={layer.out_channels}")
         weight = layer.weight.detach()
         bias = layer.bias.detach()
 
-        # Apply the custom ternary quantization logic from QAT_UNet.py
+        # Apply the custom ternary quantization to get {-1, 0, 1} float tensor
         quantized_weight_float = ScaledWeightTernary.apply(weight)
 
-        # Pack the {-1, 0, 1} float tensor into an int8 tensor for export
-        packed_weight_int8 = quantized_weight_float.to(torch.int8)
-
-        # Write scale (alpha) and packed weights
+        # 1. Write scale (alpha)
         alpha = torch.mean(torch.abs(weight)).item()
         write_float(f, alpha)
-        write_int(f, packed_weight_int8.numel())
-        write_packed_tensor(f, packed_weight_int8)
 
-        # Write bias
+        # 2. Pack the weights into a list of uint32_t
+        packed_data_uint32 = pack_ternary_weights(quantized_weight_float)
+        
+        # 3. Write the original tensor shape for C++ to reconstruct the layout
+        shape = weight.shape
+        write_int(f, len(shape)) # number of dimensions
+        for dim_size in shape:
+            write_int(f, dim_size)
+
+        # 4. Write the packed data itself
+        write_int(f, len(packed_data_uint32)) # number of uint32_t values
+        for val in packed_data_uint32:
+            f.write(struct.pack('I', val)) # 'I' for unsigned int (32-bit)
+
+        # 5. Write bias (unchanged)
         write_int(f, bias.numel())
         write_tensor(f, bias)
+
     else: # Standard nn.Conv2d
         print(f"  Exporting Float Conv2d: in={layer.in_channels}, out={layer.out_channels}")
-        weight, bias = layer.weight, layer.bias
-        write_float(f, 1.0) # Scale is 1.0 for non-quantized
+        weight, bias = layer.weight.detach(), layer.bias.detach()
+        
+        # For standard float conv, we still follow the new format for consistency
+        # 1. Write scale (alpha = 1.0 for float models)
+        write_float(f, 1.0) 
+        
+        # 2. Write shape
+        shape = weight.shape
+        write_int(f, len(shape))
+        for dim_size in shape:
+            write_int(f, dim_size)
+
+        # 3. Write data as a flat float array. We'll use a length prefix.
+        #    The C++ loader will see a non-packed format and load floats.
+        #    We will use a special flag, like packed_len = -1, to signify float data.
+        write_int(f, -1) # Use -1 as a flag for "unpacked float data"
         write_int(f, weight.numel())
         write_tensor(f, weight)
+        
+        # 4. Write bias
         write_int(f, bias.numel())
         write_tensor(f, bias)
 
@@ -78,7 +137,6 @@ def export_linear(f, layer):
     write_int(f, layer.out_features)
 
     # Export float weights
-    write_float(f, 1.0) # Scale is 1.0 for non-quantized
     write_int(f, weight.numel())
     write_tensor(f, weight)
 
@@ -124,12 +182,11 @@ def export_res_block(f, block):
     if has_time_bias:
         export_linear(f, block.time_bias)
 
-    # --- NEW: Export class_bias if it exists ---
+    # Export class_bias if it exists
     has_class_bias = block.class_bias is not None
     write_bool(f, has_class_bias)
     if has_class_bias:
         export_embedding(f, block.class_bias)
-    # -----------------------------------------
 
     export_norm(f, block.norm_2)
     export_conv(f, block.conv_2[1]) # Access the QATConv2d within the nn.Sequential
@@ -166,7 +223,7 @@ def main():
     }
 
     model_path = "qat_unet_final.pth"
-    output_path = "qat_unet_model.bin"
+    output_path = "qat_unet_model_packed.bin" # Changed output name
 
     model_init_config = {
         "img_channels": config["in_channels"],

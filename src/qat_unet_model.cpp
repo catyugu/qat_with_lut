@@ -30,6 +30,7 @@ static void read_vector(std::ifstream& file, std::vector<T>& vec, const std::str
 
 // --- Layer Reading Implementations ---
 void QATUNetModel::read_conv_layer(std::ifstream& file, QATConv2dLayer& layer) {
+    // Read standard convolution parameters
     read_from_file(file, layer.in_channels, "conv.in_channels");
     read_from_file(file, layer.out_channels, "conv.out_channels");
     read_from_file(file, layer.kernel_size_h, "conv.kernel_h");
@@ -39,13 +40,24 @@ void QATUNetModel::read_conv_layer(std::ifstream& file, QATConv2dLayer& layer) {
     read_from_file(file, layer.pad_h, "conv.pad_h");
     read_from_file(file, layer.pad_w, "conv.pad_w");
     read_from_file(file, layer.groups, "conv.groups");
-    read_from_file(file, layer.weight_scale, "conv.weight_scale");
-    
-    int weights_size;
-    read_from_file(file, weights_size, "conv.packed_weights_size");
-    layer.packed_weights.resize(weights_size);
+
+    // Read the quantization scaling factor (alpha)
+    read_from_file(file, layer.alpha, "conv.alpha");
+
+    // === NEW: Read the original weight tensor's shape ===
+    int shape_dims;
+    read_from_file(file, shape_dims, "conv.weight_shape_dims");
+    layer.shape.resize(shape_dims);
+    read_vector(file, layer.shape, "conv.weight_shape");
+    // ===================================================
+
+    // Read the packed uint32_t weights
+    int packed_weights_size;
+    read_from_file(file, packed_weights_size, "conv.packed_weights_size");
+    layer.packed_weights.resize(packed_weights_size);
     read_vector(file, layer.packed_weights, "conv.packed_weights");
-    
+
+    // Read the float bias vector
     int bias_size;
     read_from_file(file, bias_size, "conv.bias_size");
     layer.bias.resize(bias_size);
@@ -55,7 +67,6 @@ void QATUNetModel::read_conv_layer(std::ifstream& file, QATConv2dLayer& layer) {
 void QATUNetModel::read_linear_layer(std::ifstream& file, LinearLayer& layer) {
     read_from_file(file, layer.in_features, "linear.in_features");
     read_from_file(file, layer.out_features, "linear.out_features");
-    read_from_file(file, layer.weight_scale, "linear.weight_scale");
 
     int weights_size;
     read_from_file(file, weights_size, "linear.weights_size");

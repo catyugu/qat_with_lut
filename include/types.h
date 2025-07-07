@@ -38,15 +38,14 @@ struct QATConv2dLayer : public Module {
     int stride_h, stride_w;
     int pad_h, pad_w;
     int groups;
-    float weight_scale;
-    // Use uint8_t for custom ternary packed weights
-    std::vector<uint8_t> packed_weights; 
+    float alpha;                          // 权重缩放因子
+    std::vector<int> shape;               // 原始权重的形状 [out_ch, in_ch, kH, kW]
+    std::vector<uint32_t> packed_weights; // 2-bit 权重被打包到 uint32_t 向量中
     std::vector<float> bias;
 };
 
 struct LinearLayer : public Module {
     int in_features, out_features;
-    float weight_scale;
     // Use float for standard, non-quantized linear layers
     std::vector<float> weights;
     std::vector<float> bias;

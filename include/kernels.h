@@ -87,11 +87,6 @@ Tensor linear(const Tensor& input, const LinearLayer& layer);
 // Applies Group Normalization
 Tensor group_norm(const Tensor& input, const GroupNormLayer& layer);
 
-// Applies the SiLU activation function (Sigmoid-weighted Linear Unit)
-Tensor silu(const Tensor& input);
-
-// Applies the Softmax activation function along the last dimension
-Tensor softmax(const Tensor& input);
 
 // --- Composite Block Kernels ---
 

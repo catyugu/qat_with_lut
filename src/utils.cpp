@@ -5,6 +5,7 @@
 #include <iostream>  // For std::cerr, std::cout (for debugging/errors in loading)
 #include <fstream>   // For std::ifstream
 #include <cfloat>   // For std::fabs
+#include <cmath>
 // Include for image writing (define STB_IMAGE_WRITE_IMPLEMENTATION once in one .cpp file)
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -515,4 +516,3 @@ Tensor softmax(const Tensor& input) {
     }
     return output;
 }
-

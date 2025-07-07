@@ -273,70 +273,108 @@ void standard_linear_forward(
     }
 }
 
-void im2col(const Tensor& input, Tensor& col_buffer, 
-            int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
+void im2col_binary(const Tensor& input, std::vector<uint32_t>& col_buffer,
+                   int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
+                   int out_h, int out_w) {
     
     const int channels = input.shape[1];
     const int height = input.shape[2];
     const int width = input.shape[3];
-    const int out_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    const int out_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    const int channels_col = channels * kernel_h * kernel_w;
+    const int patch_size = channels * kernel_h * kernel_w;
+    const int num_patches = out_h * out_w;
 
-    col_buffer.reshape({(size_t)channels_col, (size_t)(out_h * out_w)});
-    col_buffer.zero(); // 清零以处理填充区域
+    // col_buffer 将存储 [patch_size, num_patches] 的二值化矩阵
+    // 我们需要将 patch_size 向上取整到32的倍数，以便打包
+    const int patch_size_padded = (patch_size + 31) / 32;
+    col_buffer.assign(patch_size_padded * num_patches, 0);
 
-    for (int c = 0; c < channels_col; ++c) {
-        int w_offset = c % kernel_w;
-        int h_offset = (c / kernel_w) % kernel_h;
-        int c_im = c / kernel_w / kernel_h;
+    for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
+        int h = patch_idx / out_w;
+        int w = patch_idx % out_w;
+        
+        // 当前 patch 在 col_buffer 中的起始位置
+        uint32_t* col_patch_ptr = col_buffer.data() + patch_idx * patch_size_padded;
 
-        for (int h = 0; h < out_h; ++h) {
-            for (int w = 0; w < out_w; ++w) {
-                int h_pad = h * stride_h - pad_h + h_offset;
-                int w_pad = w * stride_w - pad_w + w_offset;
+        int current_bit = 0;
+        uint32_t current_word = 0;
 
-                if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
-                    col_buffer.data[c * (out_h * out_w) + h * out_w + w] = 
-                        input.data[c_im * (height * width) + h_pad * width + w_pad];
+        for (int c_im = 0; c_im < channels; ++c_im) {
+            for (int kh = 0; kh < kernel_h; ++kh) {
+                for (int kw = 0; kw < kernel_w; ++kw) {
+                    int h_pad = h * stride_h - pad_h + kh;
+                    int w_pad = w * stride_w - pad_w + kw;
+
+                    float val = 0.0f;
+                    if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
+                        val = input.data[c_im * (height * width) + h_pad * width + w_pad];
+                    }
+
+                    // 二值化激活值: > 0 编码为 1, <= 0 编码为 0
+                    // 这是 XNOR 运算的常见处理方式 (1<->+1, 0<->-1)
+                    if (val > 0) {
+                        current_word |= (1U << current_bit);
+                    }
+
+                    current_bit++;
+                    if (current_bit == 32) {
+                        *col_patch_ptr++ = current_word;
+                        current_bit = 0;
+                        current_word = 0;
+                    }
                 }
-                // else: a zero is already in place due to col_buffer.zero()
             }
+        }
+        // 存储最后一个未满的 word
+        if (current_bit > 0) {
+            *col_patch_ptr = current_word;
         }
     }
 }
 
 
-// --- 2. 标准的 GEMM (通用矩阵乘法) 实现 ---
-// C = A * B
-// A: [M x K], B: [K x N], C: [M x N]
-void gemm(const Tensor& A, const Tensor& B, Tensor& C) {
-    const int M = A.shape[0];
-    const int K = A.shape[1];
-    const int N = B.shape[1];
+// =====================================================================
+// ===== 核心优化 2: 基于位运算的 GEMM (gemm_binary_xnor) =====
+// 使用 XNOR 和 popcount 执行矩阵乘法
+// =====================================================================
+void gemm_binary_xnor(
+    const std::vector<uint32_t>& packed_weights, // A: [M x K_padded]
+    const std::vector<uint32_t>& packed_cols,    // B^T: [N x K_padded] (注意是转置的)
+    Tensor& C,                                   // C: [M x N]
+    const int M, const int N, const int K) {
 
-    if (B.shape[0] != K || C.shape[0] != M || C.shape[1] != N) {
-        throw std::runtime_error("GEMM dimension mismatch");
-    }
+    const int K_padded_words = (K + 31) / 32; // K dimension in 32-bit words
+    C.reshape({(size_t)M, (size_t)N});
     C.zero();
 
     for (int i = 0; i < M; ++i) {
-        for (int k = 0; k < K; ++k) {
-            float A_ik = A.data[i * K + k];
-            for (int j = 0; j < N; ++j) {
-                C.data[i * N + j] += A_ik * B.data[k * N + j];
+        for (int j = 0; j < N; ++j) {
+            int acc = 0;
+            // 获取指向当前行(权重)和列(激活)的指针
+            const uint32_t* w_ptr = packed_weights.data() + i * K_padded_words;
+            const uint32_t* a_ptr = packed_cols.data() + j * K_padded_words;
+
+            // 核心循环: 一次处理32个元素
+            for (int k = 0; k < K_padded_words; ++k) {
+                uint32_t xnor_val = ~(w_ptr[k] ^ a_ptr[k]);
+                acc += _mm_popcnt_u32(xnor_val);
             }
+            
+            // popcount 计算的是值为1的位的数量 (匹配的数量)
+            // 结果 = (匹配数) - (不匹配数) = popcount - (K - popcount) = 2*popcount - K
+            C.data[i * N + j] = static_cast<float>(2 * acc - K);
         }
     }
 }
 
 
-// --- 3. 修正后的 conv2d (使用 im2col + GEMM) ---
+// =====================================================================
+// ===== 核心优化 3: 最终的 conv2d 函数 (使用位运算) =====
+// =====================================================================
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
-    PROFILE_SCOPE("conv2d_im2col");
+    PROFILE_SCOPE("conv2d_binary_xnor");
 
     const int B = input.shape[0];
-    const int C_in = input.shape[1];
+    const int C_in = layer.in_channels;
     const int H_in = input.shape[2];
     const int W_in = input.shape[3];
 
@@ -348,43 +386,36 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int H_out = (H_in + 2 * layer.pad_h - KH) / layer.stride_h + 1;
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
 
-    // A. 准备权重矩阵 (与Python逻辑完全一致)
-    // 权重被视为一个 [C_out, C_in * KH * KW] 的浮点矩阵
-    const size_t weight_matrix_rows = C_out;
-    const size_t weight_matrix_cols = C_in * KH * KW;
-    Tensor weight_matrix({weight_matrix_rows, weight_matrix_cols});
-    for (size_t i = 0; i < layer.packed_weights.size(); ++i) {
-        // 将 int8 的 {-1, 0, 1} 乘以 scale 得到浮点权重
-        weight_matrix.data[i] = static_cast<float>(static_cast<int8_t>(layer.packed_weights[i])) * layer.weight_scale;
-    }
-
-    // 为输出和 im2col 缓冲区分配内存
+    // 准备输出张量和 im2col 缓冲区
     Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
-    Tensor col_buffer; // im2col 会自动调整其大小
+    std::vector<uint32_t> col_buffer_binary;
+
+    // 计算 GEMM 的维度
+    const int M = C_out;
+    const int N = H_out * W_out;
+    const int K = C_in * KH * KW;
 
     // 对 batch 中的每个样本执行卷积
     for (int b = 0; b < B; ++b) {
-        // 从输入batch中获取一个样本
         Tensor input_sample = input.slice(b); 
 
-        // B. 将输入样本转换为列矩阵
-        im2col(input_sample, col_buffer, KH, KW, layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w);
+        // 1. 将输入样本转换为二值化的列矩阵
+        im2col_binary(input_sample, col_buffer_binary, KH, KW, 
+                      layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out);
 
-        // C. 执行矩阵乘法
-        // output_matrix = weight_matrix * col_buffer
-        // [C_out, C_in*KH*KW] * [C_in*KH*KW, H_out*W_out] -> [C_out, H_out*W_out]
-        Tensor output_matrix({(size_t)C_out, (size_t)(H_out * W_out)});
-        gemm(weight_matrix, col_buffer, output_matrix);
+        // 2. 执行位运算矩阵乘法
+        // output_matrix = packed_weights * col_buffer_binary
+        Tensor output_matrix;
+        gemm_binary_xnor(layer.packed_weights, col_buffer_binary, output_matrix, M, N, K);
         
-        // 将结果复制到最终输出张量的对应位置
-        // 注意：这里需要一个方法将 output_matrix 的数据拷贝到 output 的第 b 个 slice
-        // 我们直接在这里操作 output 的数据指针
-        size_t batch_offset = b * C_out * H_out * W_out;
-        size_t matrix_size = C_out * H_out * W_out;
-        std::copy(output_matrix.data.begin(), output_matrix.data.end(), output.data.begin() + batch_offset);
+        // 3. 将结果缩放并复制到最终输出张量的对应位置
+        size_t batch_offset = b * M * N;
+        for (size_t i = 0; i < M * N; ++i) {
+            output.data[batch_offset + i] = output_matrix.data[i] * layer.alpha;
+        }
     }
     
-    // D. 添加偏置
+    // 4. 添加偏置
     if (!layer.bias.empty()) {
         for (int b = 0; b < B; ++b) {
             for (int c = 0; c < C_out; ++c) {
