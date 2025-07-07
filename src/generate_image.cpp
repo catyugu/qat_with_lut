@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         // 1. 加载 UNet 模型
         QATUNetModel model;
         model.load_model(model_path);
-
+        load_lut("ternary_lut.bin");
         // 2. 设置扩散常量
         DiffusionConstants dc = setup_diffusion_constants(diffusion_steps);
         

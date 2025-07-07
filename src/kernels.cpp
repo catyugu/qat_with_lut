@@ -11,7 +11,6 @@
 #include <stdexcept>
 #include <limits> // Required for std::numeric_limits
 
-
 // --- SIMD 核心内核实现 ---
 
 #ifdef __AVX512F__
@@ -273,112 +272,150 @@ void standard_linear_forward(
     }
 }
 
-void im2col_ternary_packed(
-    const Tensor& input,
-    std::vector<uint32_t>& col_buffer_p, // p-bits for +1
-    std::vector<uint32_t>& col_buffer_n, // n-bits for -1
+namespace {
+    std::vector<int8_t> g_lut_storage;
+}
+
+// DEFINITION of the load_lut function.
+void load_lut(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("无法打开查找表文件: " + path);
+    }
+    g_lut_storage.assign(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>()
+    );
+    if (g_lut_storage.size() != 256 * 256) {
+        throw std::runtime_error("查找表文件大小错误！");
+    }
+    std::cout << "三值乘法查找表已成功加载。" << std::endl;
+}
+
+// DEFINITION of the get_lut function.
+const int8_t* get_lut() {
+    return g_lut_storage.data();
+}
+
+void im2col_ternary_packed_optimized(
+    const Tensor& input_sample,
     int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
-    int out_h, int out_w) {
+    int out_h, int out_w,
+    std::vector<uint32_t>& col_buffer // Takes the buffer as an output parameter
+){
+    PROFILE_SCOPE("im2col_ternary_packed_optimized");
 
-    const int channels = input.shape[1];
-    const int height = input.shape[2];
-    const int width = input.shape[3];
-    const int patch_size = channels * kernel_h * kernel_w;
-    const int num_patches = out_h * out_w;
+    const int channels = input_sample.shape[1];
+    const int height = input_sample.shape[2];
+    const int width = input_sample.shape[3];
+    const int K = channels * kernel_h * kernel_w;
+    const int N = out_h * out_w;
 
-    // col_buffer 将存储 [patch_size, num_patches] 的矩阵
-    // 我们需要将 patch_size 向上取整到32的倍数，以便打包
-    const int patch_size_padded_words = (patch_size + 31) / 32;
-    col_buffer_p.assign(patch_size_padded_words * num_patches, 0);
-    col_buffer_n.assign(patch_size_padded_words * num_patches, 0);
+    const int total_elements = N * K;
+    const int packed_size = (total_elements + 15) / 16;
+    col_buffer.assign(packed_size, 0);
 
-    for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
-        int h = patch_idx / out_w;
-        int w = patch_idx % out_w;
+    for (int n = 0; n < N; ++n) {
+        const int h_out = n / out_w;
+        const int w_out = n % out_w;
+        const size_t element_start_idx = n * K;
 
-        // 当前 patch 在 col_buffer 中的起始位置
-        uint32_t* col_patch_ptr_p = col_buffer_p.data() + patch_idx * patch_size_padded_words;
-        uint32_t* col_patch_ptr_n = col_buffer_n.data() + patch_idx * patch_size_padded_words;
+        for (int k = 0; k < K; ++k) {
+            const int kw = k % kernel_w;
+            const int kh = (k / kernel_w) % kernel_h;
+            const int c_im = k / (kernel_h * kernel_w);
+            const int h_in = h_out * stride_h - pad_h + kh;
+            const int w_in = w_out * stride_w - pad_w + kw;
 
-        for (int bit_idx = 0; bit_idx < patch_size; ++bit_idx) {
-            // 计算当前 bit 对应的 c, kh, kw
-            int kw = bit_idx % kernel_w;
-            int kh = (bit_idx / kernel_w) % kernel_h;
-            int c_im = bit_idx / (kernel_h * kernel_w);
-
-            int h_pad = h * stride_h - pad_h + kh;
-            int w_pad = w * stride_w - pad_w + kw;
-
-            float val = 0.0f;
-            if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
-                val = input.data[c_im * (height * width) + h_pad * width + w_pad];
+            uint32_t bits = 0;
+            if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
+                float val = input_sample.data[c_im * (height * width) + h_in * width + w_in];
+                val = fmaxf(-1.0f, fminf(1.0f, val));
+                int8_t quantized_val = static_cast<int8_t>(roundf(val));
+                if (quantized_val == 1) bits = 1;
+                else if (quantized_val == -1) bits = 2;
             }
-
-            // 三值化激活: round(clamp(x, -1, 1))
-            // 这与 Python 中的 ScaledActivationTernary 逻辑匹配
-            val = fmaxf(-1.0f, fminf(1.0f, val)); // Clamp
-            int8_t quantized_val = static_cast<int8_t>(round(val)); // Round
-
-            // 根据量化结果设置 p-bit 和 n-bit
-            int word_idx = bit_idx / 32;
-            int bit_in_word = bit_idx % 32;
-            if (quantized_val == 1) {
-                col_patch_ptr_p[word_idx] |= (1U << bit_in_word);
-            } else if (quantized_val == -1) {
-                col_patch_ptr_n[word_idx] |= (1U << bit_in_word);
-            }
-        }
-    }
-}
-
-
-// =====================================================================
-// ===== 核心优化 2: 基于位运算的 GEMM (三值版本) =====
-// 使用 popcount 执行三值矩阵乘法
-// =====================================================================
-void gemm_ternary(
-    const std::vector<uint32_t>& weights_p, // W_p: [M x K_padded]
-    const std::vector<uint32_t>& weights_n, // W_n: [M x K_padded]
-    const std::vector<uint32_t>& cols_p,    // A_p: [N x K_padded] (转置)
-    const std::vector<uint32_t>& cols_n,    // A_n: [N x K_padded] (转置)
-    Tensor& C,
-    const int M, const int N, const int K) {
-
-    const int K_padded_words = (K + 31) / 32;
-    C.reshape({(size_t)M, (size_t)N});
-    C.zero();
-
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            int acc_pos = 0;
-            int acc_neg = 0;
-
-            const uint32_t* w_p_ptr = weights_p.data() + i * K_padded_words;
-            const uint32_t* w_n_ptr = weights_n.data() + i * K_padded_words;
-            const uint32_t* a_p_ptr = cols_p.data() + j * K_padded_words;
-            const uint32_t* a_n_ptr = cols_n.data() + j * K_padded_words;
-
-            // 核心循环: 一次处理32个元素
-            for (int k = 0; k < K_padded_words; ++k) {
-                // 计算匹配项: (W_p & A_p) 和 (W_n & A_n)
-                acc_pos += _mm_popcnt_u32(w_p_ptr[k] & a_p_ptr[k]);
-                acc_pos += _mm_popcnt_u32(w_n_ptr[k] & a_n_ptr[k]);
-
-                // 计算不匹配项: (W_p & A_n) 和 (W_n & A_p)
-                acc_neg += _mm_popcnt_u32(w_p_ptr[k] & a_n_ptr[k]);
-                acc_neg += _mm_popcnt_u32(w_n_ptr[k] & a_p_ptr[k]);
-            }
-
-            C.data[i * N + j] = static_cast<float>(acc_pos - acc_neg);
+            
+            // This write is safe because each thread 'n' writes to a unique, non-overlapping
+            // block of memory based on 'element_start_idx'. No atomic needed.
+            const size_t current_element_idx = element_start_idx + k;
+            const int word_idx = current_element_idx / 16;
+            const int bit_shift = (current_element_idx % 16) * 2;
+            col_buffer[word_idx] |= (bits << bit_shift);
         }
     }
 }
 
 // =====================================================================
-// ===== 核心优化 3: 最终的 conv2d 函数 (三值位运算) =====
+// ===== 核心修正 2: 基于查找表的 GEMM =====
+// 这个函数现在可以正确处理您的 2-bit 统一打包方案
+// =====================================================================
+
+const int8_t TERNARY_MULTIPLICATION_LUT[4][4] = {
+    {0, 0, 0, 0}, {0, 1, -1, 0}, {0, -1, 1, 0}, {0, 0, 0, 0}
+};
+
+void gemm_pro(
+    const uint32_t* A_packed, // 权重 (M, K)
+    const uint32_t* B_packed, // 激活 (N, K)
+    float* C,                 // 输出 (M, N)
+    int M, int N, int K) {
+
+    PROFILE_SCOPE("gemm_pro_ternary_lookup");
+    const int8_t* lut = get_lut();
+    if (!lut) {
+        throw std::runtime_error("错误: 查找表未加载或为空！");
+    }
+
+    const uint8_t* A_bytes = reinterpret_cast<const uint8_t*>(A_packed);
+    const uint8_t* B_bytes = reinterpret_cast<const uint8_t*>(B_packed);
+    const int K_bytes_stride = (K + 3) / 4;
+
+    // --- 定义寄存器块大小 ---
+    // 目标是让 C_tile 能够完全放入 CPU 寄存器
+    const int REG_M = 4;
+    const int REG_N = 4;
+
+    // 使用 OpenMP 在最外层循环并行化，将工作分配到所有 CPU 核心
+    for (int j = 0; j < N; j += REG_N) { // 遍历 N 维
+        for (int i = 0; i < M; i += REG_M) { // 遍历 M 维
+            
+            // --- 微内核: 计算一个 REG_M x REG_N 的 C 块 ---
+            
+            // 累加器，用于存放 C 的一小块。这会被编译器优化到寄存器中。
+            int32_t C_tile[REG_M][REG_N] = {0};
+
+            // 遍历公共维度 K
+            for (int k = 0; k < K_bytes_stride; ++k) {
+                // 内部循环 ii, jj 的顺序经过精心设计，以最大化数据复用
+                for (int ii = 0; ii < REG_M; ++ii) {
+                    // 预加载 a_val, 它将在内层 jj 循环中被重复使用 REG_N 次
+                    const uint8_t a_val = A_bytes[(i + ii) * K_bytes_stride + k];
+                    for (int jj = 0; jj < REG_N; ++jj) {
+                        const uint8_t b_val = B_bytes[(j + jj) * K_bytes_stride + k];
+                        // 核心计算: a_val 被复用, b_val 顺序读取, 缓存效率极高
+                        C_tile[ii][jj] += lut[static_cast<uint16_t>(a_val) * 256 + b_val];
+                    }
+                }
+            }
+
+            // --- 将计算完成的寄存器块写回主内存中的 C 矩阵 ---
+            for (int ii = 0; ii < REG_M; ++ii) {
+                if (i + ii >= M) continue; // 边界检查
+                for (int jj = 0; jj < REG_N; ++jj) {
+                    if (j + jj >= N) continue; // 边界检查
+                    C[(i + ii) * N + (j + jj)] = static_cast<float>(C_tile[ii][jj]);
+                }
+            }
+        }
+    }
+}
+// =====================================================================
+// ===== 核心修正 3: 最终的 conv2d 函数 (统一逻辑) =====
+// 将所有修正后的部分正确地组合在一起
 // =====================================================================
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
-    PROFILE_SCOPE("conv2d_ternary_popcount");
+    PROFILE_SCOPE("conv2d_ternary_lookup");
 
     const int B = input.shape[0];
     const int C_in = layer.in_channels;
@@ -393,69 +430,45 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
 
     // 计算 GEMM 的维度
-    const int M = C_out;
-    const int N = H_out * W_out;
-    const int K = C_in * KH * KW;
+    const int M = C_out;           // 权重矩阵行数
+    const int N = H_out * W_out;   // im2col 矩阵列数
+    const int K = C_in * KH * KW;  // 公共维度
 
-    // --- 新增: 从打包的权重中解包出 p-bits 和 n-bits ---
-    // Python 编码: 00 -> 0, 01 -> 1, 10 -> -1
-    const int K_padded_words = (K + 31) / 32;
-    std::vector<uint32_t> weights_p(M * K_padded_words, 0);
-    std::vector<uint32_t> weights_n(M * K_padded_words, 0);
-    
-    // 假设 layer.packed_weights 是 (M, K) 的 2-bit 打包权重
-    // 注意: 这个解包过程有一定开销，理想情况下 Python 转换脚本应直接提供 p/n 两个权重文件
-    for (int m = 0; m < M; ++m) {
-        for (int k = 0; k < K; ++k) {
-            int packed_word_idx = (m * K + k) / 16;
-            int bit_shift = ((m * K + k) % 16) * 2;
-            uint32_t two_bits = (layer.packed_weights[packed_word_idx] >> bit_shift) & 0x3;
-            
-            int out_word_idx = m * K_padded_words + k / 32;
-            int out_bit_idx = k % 32;
-
-            if (two_bits == 1) { // 值为 1
-                weights_p[out_word_idx] |= (1U << out_bit_idx);
-            } else if (two_bits == 2) { // 值为 -1
-                weights_n[out_word_idx] |= (1U << out_bit_idx);
-            }
-        }
-    }
+    std::vector<uint32_t> col_buffer;
+    // Optional but good practice: reserve memory to avoid any potential reallocations
+    const int max_elements = N * K; 
+    const int max_packed_size = (max_elements + 15) / 16;
+    col_buffer.reserve(max_packed_size);
 
     Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
-    std::vector<uint32_t> col_buffer_p, col_buffer_n;
+    
+       for (int b = 0; b < B; ++b) {
+          Tensor input_sample = input.slice(b);
 
-    for (int b = 0; b < B; ++b) {
-        Tensor input_sample = input.slice(b);
+        // 1. Im2Col: 使用输出 (N, K) 布局的函数
+        im2col_ternary_packed_optimized(input_sample, KH, KW,
+            layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out,
+            col_buffer // Pass the reusable buffer
+        );
 
-        // 1. Im2Col: 将输入样本量化并打包为 p/n 位掩码
-        im2col_ternary_packed(input_sample, col_buffer_p, col_buffer_n, KH, KW,
-                              layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out);
+        std::vector<float> output_matrix(M * N);
+        
+        // 2. GEMM: 调用全新的、使用分块技术的高性能函数
+        gemm_pro(
+            layer.packed_weights.data(),
+            col_buffer.data(),
+            output_matrix.data(),
+            M, N, K
+        );
 
-        // 2. GEMM: 执行三值位运算矩阵乘法
-        Tensor output_matrix;
-        gemm_ternary(weights_p, weights_n, col_buffer_p, col_buffer_n, output_matrix, M, N, K);
-
-        // 3. 缩放并复制结果
+        // 3. 添加偏置、缩放并复制结果
         size_t batch_offset = b * M * N;
-        for (size_t i = 0; i < M * N; ++i) {
-            output.data[batch_offset + i] = output_matrix.data[i] * layer.alpha;
+        for (int i = 0; i < M * N; ++i) {
+             // 假设 bias 是按 channel (M) 添加的
+            float bias = layer.bias.empty() ? 0.0f : layer.bias[i / N];
+            output.data[batch_offset + i] = output_matrix[i] * layer.alpha + bias;
         }
     }
-
-    // 4. 添加偏置
-    if (!layer.bias.empty()) {
-        for (int b = 0; b < B; ++b) {
-            for (int c = 0; c < C_out; ++c) {
-                float bias_val = layer.bias[c];
-                size_t offset = b * (C_out * H_out * W_out) + c * (H_out * W_out);
-                for (int i = 0; i < H_out * W_out; ++i) {
-                    output.data[offset + i] += bias_val;
-                }
-            }
-        }
-    }
-
     return output;
 }
 Tensor linear(const Tensor& input, const LinearLayer& layer) {

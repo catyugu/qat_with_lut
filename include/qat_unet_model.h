@@ -56,4 +56,5 @@ private:
     void read_res_block(std::ifstream& file, QATResidualBlock& block);
 };
 
+
 #endif // QAT_UNET_MODEL_H

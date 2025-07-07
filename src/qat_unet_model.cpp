@@ -4,6 +4,7 @@
 #include <numeric>
 #include <algorithm>
 
+
 // --- Helper functions to read binary data with debugging ---
 static void log_pos(std::ifstream& file, const std::string& msg) {
     // std::cout << "[DEBUG] " << msg << " at file position: " << file.tellg() << std::endl;
