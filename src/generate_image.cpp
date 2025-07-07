@@ -13,7 +13,7 @@
 #include "stb_image_write.h"
 
 // --- Diffusion Constants Setup ---
-// ... (这部分保持不变)
+// 结构体现在包含与 Python 版本完全匹配的系数
 struct DiffusionConstants {
     int num_timesteps;
     std::vector<float> betas;
@@ -26,6 +26,7 @@ struct DiffusionConstants {
     std::vector<float> sigma;
 };
 
+// 这个函数的实现现在与 diffusion.py 完全对齐
 DiffusionConstants setup_diffusion_constants(int timesteps) {
     DiffusionConstants dc;
     dc.num_timesteps = timesteps;
@@ -82,6 +83,7 @@ int main(int argc, char* argv[]) {
         QATUNetModel model;
         model.load_model(model_path);
         load_lut("ternary_lut.bin");
+        
         // 2. 设置扩散常量
         DiffusionConstants dc = setup_diffusion_constants(diffusion_steps);
         
@@ -99,12 +101,13 @@ int main(int argc, char* argv[]) {
         std::cout << "Starting denoising loop for " << diffusion_steps << " steps..." << std::endl;
         Profiler::getInstance().reset(); 
         for (int t = diffusion_steps - 1; t >= 0; --t) {
+ 
             std::cout << "Step " << t << "..." << std::endl;
             
             Tensor time_tensor({1});
             time_tensor.data[0] = (float)t;
 
-            // **修正**: 使用命令行传入的类别标签
+            // 使用命令行传入的类别标签
             Tensor class_tensor({1});
             class_tensor.data[0] = (float)class_label; 
             

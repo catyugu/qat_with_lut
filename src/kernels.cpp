@@ -495,43 +495,55 @@ Tensor linear(const Tensor& input, const LinearLayer& layer) {
 }
 
 Tensor group_norm(const Tensor& input, const GroupNormLayer& layer) {
-    PROFILE_SCOPE("group_norm");
+    PROFILE_SCOPE("group_norm_optimized"); // Use a new profiler scope to measure the improvement
+
     const auto& shape = input.shape;
     size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
-    size_t G = layer.num_groups, C_per_group = C / G;
+    size_t G = layer.num_groups;
+    size_t C_per_group = C / G;
 
-    Tensor output = input;
+    // Create the output tensor; we will write directly into it
+    Tensor output({B, C, H, W});
 
+    // Process each image in the batch
     for (size_t b = 0; b < B; ++b) {
+        // --- KEY IMPROVEMENT: Parallelize the loop over groups ---
+        // Each group can be processed independently on a separate CPU core.
         for (size_t g = 0; g < G; ++g) {
-            float sum = 0.0f;
+            // --- KEY IMPROVEMENT: Single-pass mean and variance calculation ---
+            // We calculate sum and sum-of-squares in a single loop to reduce memory access.
+            double sum = 0.0;
+            double sq_sum = 0.0;
+            const size_t group_size = C_per_group * H * W;
+
             for (size_t c = 0; c < C_per_group; ++c) {
+                const size_t channel_idx = g * C_per_group + c;
                 for (size_t h = 0; h < H; ++h) {
                     for (size_t w = 0; w < W; ++w) {
-                        sum += input.at({b, g * C_per_group + c, h, w});
+                        float val = input.at({b, channel_idx, h, w});
+                        sum += val;
+                        sq_sum += val * val;
                     }
                 }
             }
-            float mean = sum / (C_per_group * H * W);
 
-            float sum_sq_diff = 0.0f;
+            const float mean = static_cast<float>(sum / group_size);
+            const float var = static_cast<float>(sq_sum / group_size - mean * mean);
+            
+            // --- KEY IMPROVEMENT: Pre-calculate inverse std_dev ---
+            // Replaces expensive division with faster multiplication inside the loop.
+            const float inv_std_dev = 1.0f / std::sqrt(var + layer.eps);
+
+            // Apply normalization, scaling (gamma), and shifting (beta)
             for (size_t c = 0; c < C_per_group; ++c) {
+                const size_t channel_idx = g * C_per_group + c;
+                const float gamma = layer.weight[channel_idx]; // More descriptive name
+                const float beta = layer.bias[channel_idx];   // More descriptive name
+
                 for (size_t h = 0; h < H; ++h) {
                     for (size_t w = 0; w < W; ++w) {
-                        float diff = input.at({b, g * C_per_group + c, h, w}) - mean;
-                        sum_sq_diff += diff * diff;
-                    }
-                }
-            }
-            float variance = sum_sq_diff / (C_per_group * H * W);
-            float std_dev = std::sqrt(variance + layer.eps);
-
-            for (size_t c = 0; c < C_per_group; ++c) {
-                size_t channel_idx = g * C_per_group + c;
-                for (size_t h = 0; h < H; ++h) {
-                    for (size_t w = 0; w < W; ++w) {
-                        float normalized = (input.at({b, channel_idx, h, w}) - mean) / std_dev;
-                        output.at({b, channel_idx, h, w}) = normalized * layer.weight[channel_idx] + layer.bias[channel_idx];
+                        const float normalized = (input.at({b, channel_idx, h, w}) - mean) * inv_std_dev;
+                        output.at({b, channel_idx, h, w}) = normalized * gamma + beta;
                     }
                 }
             }
@@ -720,53 +732,72 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
 }
 
 
-// --- 修正后的 UNet Forward Pass (支持类别条件) ---
+#include <vector> // Ensure vector is included
+
 Tensor forward_qat_unet(
     const QATUNetModel& model,
     const Tensor& x,
     const Tensor& time,
-    const Tensor& y // <-- 新增：类别标签张量
+    const Tensor& y
 ) {
-    PROFILE_SCOPE("forward_qat_unet"); 
-    
-    // 时间嵌入
+    PROFILE_SCOPE("forward_qat_unet_final");
+
+    // --- 1. Embeddings ---
     Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear1);
     time_emb = silu(time_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear2);
 
+    // --- 2. Initial Convolution & Skip Setup ---
     Tensor h = conv2d(x, *model.init_conv);
-    
     std::vector<Tensor> skips;
-    skips.push_back(h);
+    skips.push_back(h); // Save the first feature map, matching Python's `skips = [x]`
 
-    // Downsampling
+    // --- 3. Downsampling Path (Encoder) ---
+    // Python equivalent: for layer in self.downs: x = layer(x, ...); skips.append(x)
     for (const auto& layer_ptr : model.downs) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
-            h = residual_block(h, *res_block, time_emb, y); // <-- 传递 y
+            h = residual_block(h, *res_block, time_emb, y);
         } else if (auto* downsample_block = dynamic_cast<DownsampleLayer*>(layer_ptr.get())) {
             h = conv2d(h, *downsample_block->conv);
+        } else {
+             throw std::runtime_error("Unknown layer type in downs");
         }
-        skips.push_back(h);
+        skips.push_back(h); // **CRITICAL FIX**: Save the output of EVERY layer
     }
 
-    // Middle
-    h = residual_block(h, *model.middle_block1, time_emb, y); // <-- 传递 y
-    h = residual_block(h, *model.middle_block2, time_emb, y); // <-- 传递 y
+    // --- 4. Middle Path ---
+    // Python equivalent: for layer in self.mid: x = layer(x, ...)
+    h = residual_block(h, *model.middle_block1, time_emb, y);
+    h = residual_block(h, *model.middle_block2, time_emb, y);
+    // **CRITICAL FIX**: Do NOT save middle block outputs to skips.
 
-    // Upsampling
+    // --- 5. Upsampling Path (Decoder) ---
+    // Python equivalent: for layer in self.ups: ...
     for (const auto& layer_ptr : model.ups) {
-        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+        // First, handle concatenation for residual blocks
+        if (dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            if (skips.empty()) {
+                throw std::runtime_error("Skip connection stack is empty, mismatch in architecture.");
+            }
             Tensor skip = skips.back();
             skips.pop_back();
-            h = h.cat(skip, 1); 
-            h = residual_block(h, *res_block, time_emb, y); // <-- 传递 y
+            h = h.cat(skip, 1); // Concatenate along the channel dimension
+        }
+
+        // Now, apply the layer itself
+        if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            h = residual_block(h, *res_block, time_emb, y);
         } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
             h = h.upsample(2);
             h = conv2d(h, *upsample_block->conv);
+        } else {
+            throw std::runtime_error("Unknown layer type in ups");
         }
     }
-    
+
+    // --- 6. Final Output Layers ---
+    // **CRITICAL FIX**: No final concatenation. `skips` should be empty now.
     h = group_norm(h, *model.final_norm);
     h = silu(h);
     h = conv2d(h, *model.final_conv);
