@@ -79,9 +79,6 @@ void standard_linear_forward(
 );
 
 
-void load_lut(const std::string& path);
-const int8_t* get_lut();
-
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer);
 
 // Performs a standard linear (fully connected) layer operation

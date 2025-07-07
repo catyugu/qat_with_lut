@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <numeric>
 #include <algorithm>
+#include <functional>
 #include <random>
 // --- 模型数据结构 ---
 struct FloatLayer {
@@ -214,45 +215,72 @@ struct Tensor {
     }
 
     void reshape(const std::vector<size_t>& new_shape) {
-        size_t new_size = 1;
-        for (size_t dim : new_shape) {
-            new_size *= dim;
-        }
-
-        // If the new size is different, we re-allocate the data buffer.
-        // This fixes the error and makes the function more useful.
-        if (new_size != data.size()) {
-            data.resize(new_size);
-        }
-
-        // Always update the shape.
-        this->shape = new_shape;
-    }
-
-    Tensor permute(std::initializer_list<size_t> dims) const {
-        // Simplified permute for specific cases
-        if (shape.size() == 3 && std::equal(dims.begin(), dims.end(), std::initializer_list<size_t>{0, 2, 1}.begin())) {
-            Tensor result({shape[0], shape[2], shape[1]});
-            for (size_t i = 0; i < shape[0]; ++i) {
-                for (size_t j = 0; j < shape[1]; ++j) {
-                    for (size_t k = 0; k < shape[2]; ++k) {
-                        result.at({i, k, j}) = this->at({i, j, k});
-                    }
-                }
+            size_t new_size = 1;
+            for (size_t dim : new_shape) {
+                new_size *= dim;
             }
-            return result;
+
+            // If the new size is different, we re-allocate the data buffer.
+            // This fixes the error and makes the function more useful.
+            if (new_size != data.size()) {
+                data.resize(new_size);
+            }
+
+            // Always update the shape.
+            this->shape = new_shape;
         }
-        if (shape.size() == 4 && std::equal(dims.begin(), dims.end(), std::initializer_list<size_t>{0, 3, 1, 2}.begin())) {
-             Tensor result({shape[0], shape[3], shape[1], shape[2]});
-             for(size_t i=0; i<shape[0]; ++i)
-                for(size_t j=0; j<shape[1]; ++j)
-                    for(size_t k=0; k<shape[2]; ++k)
-                        for(size_t l=0; l<shape[3]; ++l)
-                            result.at({i, l, j, k}) = this->at({i, j, k, l});
-             return result;
+
+    Tensor permute(const std::vector<size_t>& dims) const {
+        if (dims.size() != shape.size()) {
+            throw std::runtime_error("Permute error: Number of dimensions must match tensor shape.");
         }
-        // Add other permutations as needed
-        throw std::runtime_error("Unsupported permute dimensions");
+        
+        // 检查 dims 是否是 {0, 1, ..., N-1} 的一个有效排列
+        std::vector<size_t> sorted_dims = dims;
+        std::sort(sorted_dims.begin(), sorted_dims.end());
+        for(size_t i = 0; i < sorted_dims.size(); ++i) {
+            if (sorted_dims[i] != i) {
+                throw std::runtime_error("Permute error: Invalid dimension specified.");
+            }
+        }
+
+        // 计算新的形状
+        std::vector<size_t> new_shape(shape.size());
+        for (size_t i = 0; i < dims.size(); ++i) {
+            new_shape[i] = shape[dims[i]];
+        }
+
+        Tensor result(new_shape);
+        
+        // 创建一个索引数组用于遍历
+        std::vector<size_t> old_indices(shape.size(), 0);
+        std::vector<size_t> new_indices(shape.size(), 0);
+
+        // 遍历所有元素
+        for (size_t i = 0; i < this->numel(); ++i) {
+            // 1. 从一维索引 i 计算原始的多维索引 (old_indices)
+            size_t temp_i = i;
+            for (int j = shape.size() - 1; j >= 0; --j) {
+                old_indices[j] = temp_i % shape[j];
+                temp_i /= shape[j];
+            }
+
+            // 2. 根据 permute 的 dims 映射计算新的多维索引 (new_indices)
+            for (size_t j = 0; j < dims.size(); ++j) {
+                new_indices[j] = old_indices[dims[j]];
+            }
+            
+            // 3. 将新多维索引转换为一维索引，并复制数据
+            size_t new_flat_index = 0;
+            size_t stride = 1;
+            for (int j = new_shape.size() - 1; j >= 0; --j) {
+                new_flat_index += new_indices[j] * stride;
+                stride *= new_shape[j];
+            }
+            result.data[new_flat_index] = this->data[i];
+        }
+        
+        return result;
     }
     
     Tensor transpose(size_t dim1, size_t dim2) const {
@@ -263,27 +291,64 @@ struct Tensor {
         throw std::runtime_error("Unsupported transpose dimensions");
     }
 
+// 在 Tensor 结构体中，找到并替换掉旧的 matmul 函数
     Tensor matmul(const Tensor& other) const {
-        // Simplified matmul for (B, M, K) x (B, K, N) -> (B, M, N)
-        if(this->shape.size() != 3 || other.shape.size() != 3) throw std::runtime_error("Matmul only supports 3D tensors");
-        if(this->shape[0] != other.shape[0] || this->shape[2] != other.shape[1]) throw std::runtime_error("Matmul shape mismatch");
-        
-        size_t B = shape[0];
-        size_t M = shape[1];
-        size_t K = shape[2];
-        size_t N = other.shape[2];
 
-        Tensor result({B, M, N});
-        for(size_t b=0; b<B; ++b)
-            for(size_t m=0; m<M; ++m)
-                for(size_t n=0; n<N; ++n) {
-                    float sum = 0.0f;
-                    for(size_t k=0; k<K; ++k) {
-                        sum += this->at({b, m, k}) * other.at({b, k, n});
+        // --- Case 1: Batched Matrix Multiplication (3D x 3D) ---
+        // This is the case needed for the attention block: (B, M, K) @ (B, K, N) -> (B, M, N)
+        if (this->shape.size() == 3 && other.shape.size() == 3) {
+            if (this->shape[0] != other.shape[0]) {
+                throw std::runtime_error("Matmul error (3D): Batch dimensions must be equal.");
+            }
+            if (this->shape[2] != other.shape[1]) {
+                throw std::runtime_error("Matmul error (3D): Inner dimensions are not compatible.");
+            }
+
+            size_t B = this->shape[0];
+            size_t M = this->shape[1];
+            size_t K = this->shape[2];
+            size_t N = other.shape[2];
+
+            Tensor result({B, M, N});
+            result.zero(); // Initialize with zeros
+
+            for (size_t b = 0; b < B; ++b) {
+                for (size_t m = 0; m < M; ++m) {
+                    for (size_t n = 0; n < N; ++n) {
+                        for (size_t k = 0; k < K; ++k) {
+                            // result[b, m, n] += this[b, m, k] * other[b, k, n]
+                            result.at({b, m, n}) += this->at({b, m, k}) * other.at({b, k, n});
+                        }
                     }
-                    result.at({b, m, n}) = sum;
                 }
-        return result;
+            }
+            return result;
+        }
+        // --- Case 2: Standard Matrix Multiplication (2D x 2D) ---
+        // (M, K) @ (K, N) -> (M, N)
+        else if (this->shape.size() == 2 && other.shape.size() == 2) {
+            if (this->shape[1] != other.shape[0]) {
+                throw std::runtime_error("Matmul error (2D): Inner dimensions are not compatible.");
+            }
+            size_t M = this->shape[0];
+            size_t K = this->shape[1];
+            size_t N = other.shape[1];
+            
+            Tensor result({M, N});
+            result.zero();
+
+            for (size_t m = 0; m < M; ++m) {
+                for (size_t n = 0; n < N; ++n) {
+                    for (size_t k = 0; k < K; ++k) {
+                        result.at({m, n}) += this->at({m, k}) * other.at({k, n});
+                    }
+                }
+            }
+            return result;
+        }
+        
+        // --- Error Case: Unsupported shapes ---
+        throw std::runtime_error("Matmul only supports 3D x 3D or 2D x 2D tensor multiplication.");
     }
     
     Tensor cat(const Tensor& other, size_t dim) const {
@@ -411,5 +476,74 @@ struct Tensor {
         }
         return output;
     }
+    Tensor hadamard_transform() const {
+        if (shape.size() != 4) {
+            throw std::runtime_error("Hadamard transform only supports 4D tensors (B, C, H, W).");
+        }
+        size_t C = shape[1];
+        if (C == 0) return *this;
+
+        size_t target_dim = 1;
+        while (target_dim < C) {
+            target_dim *= 2;
+        }
+
+        // --- FIX ---
+        // Explicitly declare the type of the recursive lambda
+        std::function<Tensor(size_t)> get_hadamard_matrix = 
+            [&](size_t n) -> Tensor {
+            if (n == 1) {
+                Tensor h({1, 1});
+                h.data[0] = 1.0f;
+                return h;
+            }
+            // Now the recursive call is valid
+            Tensor h_half = get_hadamard_matrix(n / 2); 
+            Tensor h({n, n});
+            for(size_t i=0; i<n/2; ++i) {
+                for(size_t j=0; j<n/2; ++j) {
+                    float val = h_half.at({i, j});
+                    h.at({i, j}) = val;
+                    h.at({i, j + n/2}) = val;
+                    h.at({i + n/2, j}) = val;
+                    h.at({i + n/2, j + n/2}) = -val;
+                }
+            }
+            return h;
+        };
+        // --- END FIX ---
+
+        Tensor h_matrix = get_hadamard_matrix(target_dim);
+        h_matrix = h_matrix.mul_scalar(1.0f / std::sqrt(static_cast<float>(target_dim)));
+        
+        Tensor input_reshaped = this->permute({0, 2, 3, 1}).view({shape[0] * shape[2] * shape[3], C});
+
+        Tensor input_padded = input_reshaped;
+        if (C < target_dim) {
+            // NOTE: This padding logic is simplified. You might need to implement a
+            // proper `cat` or `pad` function in your Tensor class if this doesn't work.
+            Tensor padded_tensor({shape[0] * shape[2] * shape[3], target_dim});
+            padded_tensor.zero();
+            // Manually copy data
+            for(size_t i = 0; i < padded_tensor.shape[0]; ++i) {
+                for (size_t j = 0; j < C; ++j) {
+                    padded_tensor.at({i, j}) = input_reshaped.at({i, j});
+                }
+            }
+            input_padded = padded_tensor;
+        }
+        input_padded.reshape({shape[0] * shape[2] * shape[3], target_dim});
+
+        Tensor transformed = input_padded.matmul(h_matrix.permute({1, 0})); // Transpose for matmul
+        
+        if (C < target_dim) {
+             // NOTE: Ensure your 'slice' can handle this column-wise slicing.
+             transformed = transformed.slice(1, 0, C); 
+        }
+
+        transformed.reshape({shape[0], shape[2], shape[3], C});
+        return transformed.permute({0, 3, 1, 2});
+    }
+    
 };
 #endif // TYPES_H

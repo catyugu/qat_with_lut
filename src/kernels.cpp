@@ -271,151 +271,120 @@ void standard_linear_forward(
         }
     }
 }
-
-namespace {
-    std::vector<int8_t> g_lut_storage;
-}
-
-// DEFINITION of the load_lut function.
-void load_lut(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        throw std::runtime_error("无法打开查找表文件: " + path);
-    }
-    g_lut_storage.assign(
-        (std::istreambuf_iterator<char>(file)),
-        std::istreambuf_iterator<char>()
-    );
-    if (g_lut_storage.size() != 256 * 256) {
-        throw std::runtime_error("查找表文件大小错误！");
-    }
-    std::cout << "三值乘法查找表已成功加载。" << std::endl;
-}
-
-// DEFINITION of the get_lut function.
-const int8_t* get_lut() {
-    return g_lut_storage.data();
-}
-
-void im2col_ternary_packed_optimized(
+void im2col_float(
     const Tensor& input_sample,
     int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
     int out_h, int out_w,
-    std::vector<uint32_t>& col_buffer // Takes the buffer as an output parameter
-){
-    PROFILE_SCOPE("im2col_ternary_packed_optimized");
+    std::vector<float>& col_buffer // 输出浮点数的列缓冲
+) {
+    PROFILE_SCOPE("im2col_float");
 
     const int channels = input_sample.shape[1];
     const int height = input_sample.shape[2];
     const int width = input_sample.shape[3];
-    const int K = channels * kernel_h * kernel_w;
-    const int N = out_h * out_w;
+    const int K = channels * kernel_h * kernel_w; // 列矩阵的“高度”
+    const int N = out_h * out_w;                   // 列矩阵的“宽度”
 
-    const int total_elements = N * K;
-    const int packed_size = (total_elements + 15) / 16;
-    col_buffer.assign(packed_size, 0);
+    col_buffer.assign(K * N, 0.0f);
 
-    for (int n = 0; n < N; ++n) {
-        const int h_out = n / out_w;
-        const int w_out = n % out_w;
-        const size_t element_start_idx = n * K;
-
-        for (int k = 0; k < K; ++k) {
-            const int kw = k % kernel_w;
-            const int kh = (k / kernel_w) % kernel_h;
-            const int c_im = k / (kernel_h * kernel_w);
+    // 遍历每一个输出像素，为它构建一个列
+    for (int k = 0; k < K; ++k) {
+        const int kw = k % kernel_w;
+        const int kh = (k / kernel_w) % kernel_h;
+        const int c_im = k / (kernel_h * kernel_w);
+        
+        for (int n = 0; n < N; ++n) {
+            const int h_out = n / out_w;
+            const int w_out = n % out_w;
             const int h_in = h_out * stride_h - pad_h + kh;
             const int w_in = w_out * stride_w - pad_w + kw;
 
-            uint32_t bits = 0;
             if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
-                float val = input_sample.data[c_im * (height * width) + h_in * width + w_in];
-                val = fmaxf(-1.0f, fminf(1.0f, val));
-                int8_t quantized_val = static_cast<int8_t>(roundf(val));
-                if (quantized_val == 1) bits = 1;
-                else if (quantized_val == -1) bits = 2;
+                // 直接从输入张量中复制浮点值
+                col_buffer[k * N + n] = input_sample.at({0, (size_t)c_im, (size_t)h_in, (size_t)w_in});
             }
-            
-            // This write is safe because each thread 'n' writes to a unique, non-overlapping
-            // block of memory based on 'element_start_idx'. No atomic needed.
-            const size_t current_element_idx = element_start_idx + k;
-            const int word_idx = current_element_idx / 16;
-            const int bit_shift = (current_element_idx % 16) * 2;
-            col_buffer[word_idx] |= (bits << bit_shift);
+            // 对于 padding 区域，值保持为 0，无需操作
         }
     }
 }
 
+
 // =====================================================================
-// ===== 核心修正 2: 基于查找表的 GEMM =====
-// 这个函数现在可以正确处理您的 2-bit 统一打包方案
+// ===== 核心修正 2: 全新的非 LUT GEMM 内核 =====
+// 这个函数将 2-bit 打包的权重 (A) 与浮点数的 im2col 激活 (B) 相乘。
+// 它通过寄存器分块和 OpenMP 实现了高度优化。
 // =====================================================================
-
-const int8_t TERNARY_MULTIPLICATION_LUT[4][4] = {
-    {0, 0, 0, 0}, {0, 1, -1, 0}, {0, -1, 1, 0}, {0, 0, 0, 0}
-};
-
-void gemm_pro(
-    const uint32_t* A_packed, // 权重 (M, K)
-    const uint32_t* B_packed, // 激活 (N, K)
-    float* C,                 // 输出 (M, N)
-    int M, int N, int K) {
-
-    PROFILE_SCOPE("gemm_pro_ternary_lookup");
-    const int8_t* lut = get_lut();
-    if (!lut) {
-        throw std::runtime_error("错误: 查找表未加载或为空！");
-    }
-
-    const uint8_t* A_bytes = reinterpret_cast<const uint8_t*>(A_packed);
-    const uint8_t* B_bytes = reinterpret_cast<const uint8_t*>(B_packed);
-    const int K_bytes_stride = (K + 3) / 4;
+void gemm_packed_x_float_non_lut(
+    const uint8_t* A_packed, // 权重 (M, K), 2-bit packed
+    const float* B_float,    // 激活 (K, N), float
+    float* C,                // 输出 (M, N), float
+    int M, int N, int K
+) {
+    PROFILE_SCOPE("gemm_packed_x_float_non_lut");
 
     // --- 定义寄存器块大小 ---
     // 目标是让 C_tile 能够完全放入 CPU 寄存器
-    const int REG_M = 4;
-    const int REG_N = 4;
+    const int REG_M = 8;
+    const int REG_N = 6;
 
-    // 使用 OpenMP 在最外层循环并行化，将工作分配到所有 CPU 核心
-    for (int j = 0; j < N; j += REG_N) { // 遍历 N 维
-        for (int i = 0; i < M; i += REG_M) { // 遍历 M 维
+    for (int i = 0; i < M; i += REG_M) {
+        for (int j = 0; j < N; j += REG_N) {
             
             // --- 微内核: 计算一个 REG_M x REG_N 的 C 块 ---
-            
-            // 累加器，用于存放 C 的一小块。这会被编译器优化到寄存器中。
-            int32_t C_tile[REG_M][REG_N] = {0};
+            float C_tile[REG_M][REG_N] = {0};
 
-            // 遍历公共维度 K
-            for (int k = 0; k < K_bytes_stride; ++k) {
-                // 内部循环 ii, jj 的顺序经过精心设计，以最大化数据复用
+            for (int k = 0; k < K; ++k) {
+                // 1. 解包权重
+                const size_t weight_byte_idx = k / 4;
+                const size_t weight_bit_shift = (k % 4) * 2;
+                
+                // 2. 预加载 B 中的一行数据到寄存器
+                float b_vals[REG_N];
+                for(int jj=0; jj < REG_N; ++jj) {
+                    if (j + jj < N) {
+                       b_vals[jj] = B_float[k * N + (j + jj)];
+                    }
+                }
+
+                // 3. 循环展开，最大化指令级并行
                 for (int ii = 0; ii < REG_M; ++ii) {
-                    // 预加载 a_val, 它将在内层 jj 循环中被重复使用 REG_N 次
-                    const uint8_t a_val = A_bytes[(i + ii) * K_bytes_stride + k];
+                    if (i + ii >= M) continue;
+
+                    // 解包一个三值权重: {-1, 0, 1}
+                    const uint8_t packed_byte = A_packed[(i + ii) * ((K + 3) / 4) + weight_byte_idx];
+                    const uint8_t two_bit_val = (packed_byte >> weight_bit_shift) & 0x03;
+                    const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
+
+                    // 如果权重为0，则跳过所有乘法
+                    if (w == 0.0f) continue;
+
+                    // 将权重与预加载的 B 行数据相乘
                     for (int jj = 0; jj < REG_N; ++jj) {
-                        const uint8_t b_val = B_bytes[(j + jj) * K_bytes_stride + k];
-                        // 核心计算: a_val 被复用, b_val 顺序读取, 缓存效率极高
-                        C_tile[ii][jj] += lut[static_cast<uint16_t>(a_val) * 256 + b_val];
+                        if (j + jj < N) {
+                            C_tile[ii][jj] += w * b_vals[jj];
+                        }
                     }
                 }
             }
 
             // --- 将计算完成的寄存器块写回主内存中的 C 矩阵 ---
             for (int ii = 0; ii < REG_M; ++ii) {
-                if (i + ii >= M) continue; // 边界检查
+                if (i + ii >= M) continue;
                 for (int jj = 0; jj < REG_N; ++jj) {
-                    if (j + jj >= N) continue; // 边界检查
-                    C[(i + ii) * N + (j + jj)] = static_cast<float>(C_tile[ii][jj]);
+                    if (j + jj >= N) continue;
+                    C[(i + ii) * N + (j + jj)] = C_tile[ii][jj];
                 }
             }
         }
     }
 }
+
 // =====================================================================
 // ===== 核心修正 3: 最终的 conv2d 函数 (统一逻辑) =====
 // 将所有修正后的部分正确地组合在一起
 // =====================================================================
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
-    PROFILE_SCOPE("conv2d_ternary_lookup");
+    PROFILE_SCOPE("conv2d_ternary_optimized");
 
     const int B = input.shape[0];
     const int C_in = layer.in_channels;
@@ -430,47 +399,51 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
 
     // 计算 GEMM 的维度
-    const int M = C_out;           // 权重矩阵行数
-    const int N = H_out * W_out;   // im2col 矩阵列数
-    const int K = C_in * KH * KW;  // 公共维度
+    const int M = C_out;
+    const int N = H_out * W_out;
+    const int K = C_in * KH * KW;
 
-    std::vector<uint32_t> col_buffer;
-    // Optional but good practice: reserve memory to avoid any potential reallocations
-    const int max_elements = N * K; 
-    const int max_packed_size = (max_elements + 15) / 16;
-    col_buffer.reserve(max_packed_size);
+    // 为 im2col 和 gemm 输出创建可复用的缓冲区
+    std::vector<float> col_buffer(K * N);
+    std::vector<float> gemm_output_buffer(M * N);
 
     Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
     
-       for (int b = 0; b < B; ++b) {
-          Tensor input_sample = input.slice(b);
+    // 获取指向打包权重的指针
+    const uint8_t* packed_weights_ptr = reinterpret_cast<const uint8_t*>(layer.packed_weights.data());
+    
+    // 按批次处理
+    for (int b = 0; b < B; ++b) {
+        // 从批处理中切片出单个样本
+        Tensor input_sample = input.slice(b);
 
-        // 1. Im2Col: 使用输出 (N, K) 布局的函数
-        im2col_ternary_packed_optimized(input_sample, KH, KW,
+        // 1. Im2Col: 使用正确的浮点数版本
+        im2col_float(input_sample, KH, KW,
             layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out,
-            col_buffer // Pass the reusable buffer
+            col_buffer
         );
 
-        std::vector<float> output_matrix(M * N);
-        
-        // 2. GEMM: 调用全新的、使用分块技术的高性能函数
-        gemm_pro(
-            layer.packed_weights.data(),
+        // 2. GEMM: 调用全新的、非 LUT 的高性能函数
+        gemm_packed_x_float_non_lut(
+            packed_weights_ptr,
             col_buffer.data(),
-            output_matrix.data(),
+            gemm_output_buffer.data(),
             M, N, K
         );
 
-        // 3. 添加偏置、缩放并复制结果
-        size_t batch_offset = b * M * N;
-        for (int i = 0; i < M * N; ++i) {
-             // 假设 bias 是按 channel (M) 添加的
-            float bias = layer.bias.empty() ? 0.0f : layer.bias[i / N];
-            output.data[batch_offset + i] = output_matrix[i] * layer.alpha + bias;
+        // 3. Col2Im: 将 GEMM 的结果重塑并添加偏置/缩放
+        for (int c = 0; c < M; ++c) {
+            const float bias = layer.bias.empty() ? 0.0f : layer.bias[c];
+            for (int hw = 0; hw < N; ++hw) {
+                // 计算在最终输出张量中的索引
+                size_t out_idx = b * (M * N) + c * N + hw;
+                output.data[out_idx] = gemm_output_buffer[c * N + hw] * layer.alpha + bias;
+            }
         }
     }
     return output;
 }
+
 Tensor linear(const Tensor& input, const LinearLayer& layer) {
     PROFILE_SCOPE("linear"); // <-- 添加宏
     const auto& in_shape = input.shape;
@@ -564,6 +537,12 @@ Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     Tensor k = qkv.slice(1, C, C);
     Tensor v = qkv.slice(1, C * 2, C);
 
+    // --- 新增：应用哈达玛变换 ---
+    q = q.hadamard_transform();
+    k = k.hadamard_transform();
+    v = v.hadamard_transform();
+    // -------------------------
+
     q.reshape({B, C, H * W});
     k.reshape({B, C, H * W});
     v.reshape({B, C, H * W});
@@ -572,7 +551,7 @@ Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     k = k.permute({0, 2, 1}); 
     v = v.permute({0, 2, 1}); 
     
-    Tensor scores = q.matmul(k.transpose(1, 2)); 
+    Tensor scores = q.matmul(k.permute({0, 2, 1})); 
     scores = scores.mul_scalar(1.0f / std::sqrt(static_cast<float>(C)));
     scores = softmax(scores);
 
@@ -734,6 +713,7 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
 
 #include <vector> // Ensure vector is included
 
+// 替换旧的 forward_qat_unet 函数
 Tensor forward_qat_unet(
     const QATUNetModel& model,
     const Tensor& x,
@@ -751,10 +731,9 @@ Tensor forward_qat_unet(
     // --- 2. Initial Convolution & Skip Setup ---
     Tensor h = conv2d(x, *model.init_conv);
     std::vector<Tensor> skips;
-    skips.push_back(h); // Save the first feature map, matching Python's `skips = [x]`
+    skips.push_back(h);
 
     // --- 3. Downsampling Path (Encoder) ---
-    // Python equivalent: for layer in self.downs: x = layer(x, ...); skips.append(x)
     for (const auto& layer_ptr : model.downs) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
             h = residual_block(h, *res_block, time_emb, y);
@@ -763,31 +742,23 @@ Tensor forward_qat_unet(
         } else {
              throw std::runtime_error("Unknown layer type in downs");
         }
-        skips.push_back(h); // **关键修正**: 保存每一个层的输出
+        skips.push_back(h);
     }
 
     // --- 4. Middle Path ---
-    // Python equivalent: for layer in self.mid: x = layer(x, ...)
     h = residual_block(h, *model.middle_block1, time_emb, y);
     h = residual_block(h, *model.middle_block2, time_emb, y);
-    // **CRITICAL FIX**: Do NOT save middle block outputs to skips.
 
-    // --- 5. Upsampling Path (Decoder) ---
-    // Python equivalent: for layer in self.ups: ...
+    // --- 5. Upsampling Path (Decoder) --- (修正后的逻辑)
     for (const auto& layer_ptr : model.ups) {
-        // 首先，为残差块处理拼接
-        if (dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
-            if (skips.empty()) {
-                throw std::runtime_error("Skip connection stack is empty, mismatch in architecture.");
-            }
-            Tensor skip = skips.back(); // 从skips中取出正确的特征图
-            skips.pop_back();
-            h = h.cat(skip, 1); // 沿通道维度拼接
-        }
-        // Now, apply the layer itself
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
+            // 先拼接，再送入残差块
+            Tensor skip = skips.back();
+            skips.pop_back();
+            h = h.cat(skip, 1); 
             h = residual_block(h, *res_block, time_emb, y);
         } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
+            // 上采样层不涉及拼接
             h = h.upsample(2);
             h = conv2d(h, *upsample_block->conv);
         } else {
@@ -796,7 +767,6 @@ Tensor forward_qat_unet(
     }
 
     // --- 6. Final Output Layers ---
-    // **CRITICAL FIX**: No final concatenation. `skips` should be empty now.
     h = group_norm(h, *model.final_norm);
     h = silu(h);
     h = conv2d(h, *model.final_conv);

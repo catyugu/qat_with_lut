@@ -72,7 +72,6 @@ int main(int argc, char* argv[]) {
         // 1. Load the UNet model (ensure this is from the EMA weights)
         QATUNetModel model;
         model.load_model(model_path);
-        load_lut("ternary_lut.bin");
         std::cout << "Successfully loaded EMA model and LUT." << std::endl;
 
         // 2. Setup diffusion constants EXACTLY as in the Python script
@@ -91,6 +90,7 @@ int main(int argc, char* argv[]) {
         // 4. Denoising loop (from t=999 down to 0)
         std::cout << "Starting sampling for class " << class_label << "..." << std::endl;
         for (int t = num_timesteps - 1; t >= 0; --t) {
+            std::cout << "Processing timestep " << t << "..." << std::endl;
             // Prepare time and class label tensors for the model
             Tensor time_tensor({1});
             time_tensor.data[0] = static_cast<float>(t);
