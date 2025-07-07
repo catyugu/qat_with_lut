@@ -8,8 +8,8 @@
 #include <stdexcept>
 #include "qat_unet_model.h"
 #include "utils.h"
-#include "kernels.h" 
-#include "profiler.h" 
+#include "kernels.h"
+#include "profiler.h"
 #include "stb_image_write.h"
 
 // --- Diffusion Constants Setup ---
@@ -137,8 +137,14 @@ int main(int argc, char* argv[]) {
         Profiler::getInstance().report();
         std::cout << "Denoising complete." << std::endl;
 
-        // 6. 转换最终张量为图像并保存 (这部分逻辑正确，保持不变)
-        // ... (省略)
+        // 5. 保存图像
+        std::cout << "Saving final image to " << output_path << std::endl;
+        if (!save_image_from_float_array(output_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
+            std::cerr << "Failed to save the image." << std::endl;
+        } else {
+            std::cout << "Image saved successfully." << std::endl;
+        }
+
     } catch (const std::exception& e) {
         std::cerr << "An error occurred: " << e.what() << std::endl;
         return 1;

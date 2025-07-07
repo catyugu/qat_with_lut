@@ -596,48 +596,68 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
 }
 // --- Main UNet Forward Pass ---
 // --- Residual Block ---
-Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block, const Tensor& y) {
-    Tensor h = input;
-
-    // First normalization and convolution
-    h = group_norm(h, *block.norm_1);
+Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const Tensor& time_emb, const Tensor& y) {
+    PROFILE_SCOPE("residual_block");
+    
+    Tensor h = group_norm(input, *block.norm_1);
     h = silu(h);
     h = conv2d(h, *block.conv_1);
 
-    // Add time and class embeddings
     if (block.time_bias) {
-        Tensor time_bias = linear(time_emb, *block.time_bias);
-        h = h.add(time_bias.view({h.shape[0], h.shape[1], 1, 1})); // 修正：使用view
+        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
+        // Reshape a [B, C] tensor to [B, C, 1, 1] for broadcasting
+        time_bias.reshape({time_bias.shape[0], time_bias.shape[1], 1, 1});
+        h = h.add(time_bias);
     }
-
+    
+    // **新增**: 添加类别偏置逻辑
     if (block.class_bias) {
-        int class_idx = static_cast<int>(y.data[0]);
+        int class_idx = static_cast<int>(y.data[0]); // 获取类别索引
         int embedding_dim = block.class_bias->embedding_dim;
+        
+        // 创建一个张量来存储查找的嵌入向量
         Tensor class_bias_tensor({1, (size_t)embedding_dim}); 
         
         const auto& weights = block.class_bias->weight;
+        // 从嵌入权重中拷贝出对应类别的向量
         std::copy(weights.begin() + class_idx * embedding_dim,
                   weights.begin() + (class_idx + 1) * embedding_dim,
                   class_bias_tensor.data.begin());
 
-        h = h.add(class_bias_tensor.view({h.shape[0], h.shape[1], 1, 1})); // 修正：使用view
+        // Reshape a [1, C] tensor to [1, C, 1, 1] for broadcasting
+        class_bias_tensor.reshape({1, (size_t)embedding_dim, 1, 1});
+        h = h.add(class_bias_tensor);
     }
 
-    // Second normalization and convolution
-    h = group_norm(h, *block.norm_2);
-    h = silu(h);
-    h = conv2d(h, *block.conv_2);
-
-    // Add residual connection
+    Tensor h2 = group_norm(h, *block.norm_2);
+    h2 = silu(h2);
+    h2 = conv2d(h2, *block.conv_2);
+    
+    Tensor residual_conn = input;
     if (block.residual_connection) {
-        return h.add(conv2d(input, *block.residual_connection));
+        residual_conn = conv2d(input, *block.residual_connection);
     }
-    return h.add(input);
+    
+    Tensor out = h2.add(residual_conn);
+
+    if (block.attention) {
+        out = attention_block(out, *block.attention);
+    }
+    
+    return out;
 }
 
 
-Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor& time, const Tensor& y) {
+// --- 修正后的 UNet Forward Pass (支持类别条件) ---
+Tensor forward_qat_unet(
+    const QATUNetModel& model,
+    const Tensor& x,
+    const Tensor& time,
+    const Tensor& y // <-- 新增：类别标签张量
+) {
     PROFILE_SCOPE("forward_qat_unet"); 
+    
+    // 时间嵌入
     Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear1);
     time_emb = silu(time_emb);
@@ -648,24 +668,27 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     std::vector<Tensor> skips;
     skips.push_back(h);
 
+    // Downsampling
     for (const auto& layer_ptr : model.downs) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
-            h = residual_block(h, time_emb, *res_block,y);
+            h = residual_block(h, *res_block, time_emb, y); // <-- 传递 y
         } else if (auto* downsample_block = dynamic_cast<DownsampleLayer*>(layer_ptr.get())) {
             h = conv2d(h, *downsample_block->conv);
         }
         skips.push_back(h);
     }
 
-    h = residual_block(h, time_emb, *model.middle_block1, y);
-    h = residual_block(h, time_emb, *model.middle_block2, y);
+    // Middle
+    h = residual_block(h, *model.middle_block1, time_emb, y); // <-- 传递 y
+    h = residual_block(h, *model.middle_block2, time_emb, y); // <-- 传递 y
 
+    // Upsampling
     for (const auto& layer_ptr : model.ups) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
             Tensor skip = skips.back();
             skips.pop_back();
             h = h.cat(skip, 1); 
-            h = residual_block(h, time_emb, *res_block,y);
+            h = residual_block(h, *res_block, time_emb, y); // <-- 传递 y
         } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
             h = h.upsample(2);
             h = conv2d(h, *upsample_block->conv);
@@ -678,4 +701,3 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
 
     return h;
 }
-
