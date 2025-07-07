@@ -541,7 +541,7 @@ Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer
 
     for(size_t b = 0; b < B; ++b) {
         for(size_t i = 0; i < half_dim; ++i) {
-            float emb = std::exp(static_cast<float>(i) * -log_10000 / (half_dim - 1.0f));
+            float emb = std::exp(static_cast<float>(i) * -log_10000 / half_dim);
             float arg = time.data[b] * layer.time_emb_scale * emb;
             output.at({b, i}) = std::sin(arg);
             output.at({b, i + half_dim}) = std::cos(arg);
