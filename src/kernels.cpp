@@ -763,7 +763,7 @@ Tensor forward_qat_unet(
         } else {
              throw std::runtime_error("Unknown layer type in downs");
         }
-        skips.push_back(h); // **CRITICAL FIX**: Save the output of EVERY layer
+        skips.push_back(h); // **关键修正**: 保存每一个层的输出
     }
 
     // --- 4. Middle Path ---
@@ -775,16 +775,15 @@ Tensor forward_qat_unet(
     // --- 5. Upsampling Path (Decoder) ---
     // Python equivalent: for layer in self.ups: ...
     for (const auto& layer_ptr : model.ups) {
-        // First, handle concatenation for residual blocks
+        // 首先，为残差块处理拼接
         if (dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
             if (skips.empty()) {
                 throw std::runtime_error("Skip connection stack is empty, mismatch in architecture.");
             }
-            Tensor skip = skips.back();
+            Tensor skip = skips.back(); // 从skips中取出正确的特征图
             skips.pop_back();
-            h = h.cat(skip, 1); // Concatenate along the channel dimension
+            h = h.cat(skip, 1); // 沿通道维度拼接
         }
-
         // Now, apply the layer itself
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
             h = residual_block(h, *res_block, time_emb, y);

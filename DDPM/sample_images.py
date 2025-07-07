@@ -1,47 +1,78 @@
-import argparse
+# DDPM/train_qat_cifar.py
+# Final robust training script using Progressive Quantization.
+
+import os
 import torch
+import argparse
 import torchvision
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torchvision.utils as tv_utils
+from PIL import Image
 
-from ddpm import script_utils
-
+# Import the necessary components from your project structure
+from ddpm.QAT_UNet import QATUNet
+from ddpm.diffusion import GaussianDiffusion, generate_linear_schedule
+from ddpm.script_utils_qat import get_transform, cycle
 
 def main():
-    args = create_argparser().parse_args()
-    device = args.device
+    parser = argparse.ArgumentParser(description="Robust QAT Training Script")
 
-    try:
-        diffusion = script_utils.get_diffusion_from_args(args).to(device)
-        diffusion.load_state_dict(torch.load(args.model_path))
+    # Paths
+    parser.add_argument("--dataset_path", type=str, default="./data", help="Path to CIFAR-10 dataset")
+    parser.add_argument("--save_path", type=str, default="./qat_unet_final.pth", help="Path to save the trained model")
+    parser.add_argument("--device", type=str, default="cuda:3" if torch.cuda.is_available() else "cpu")
+    # Diffusion Hyperparameters
+    parser.add_argument("--num_timesteps", type=int, default=1000)
 
-        if args.use_labels:
-            for label in range(10):
-                y = torch.ones(args.num_images // 10, dtype=torch.long, device=device) * label
-                samples = diffusion.sample(args.num_images // 10, device, y=y)
+    # UNet Hyperparameters
+    parser.add_argument("--base_channels", type=int, default=128)
+    parser.add_argument("--channel_mults", type=str, default="1,2,2,2")
+    parser.add_argument("--num_res_blocks", type=int, default=2)
+    parser.add_argument("--time_emb_dim", type=int, default=512)
+    parser.add_argument("--norm", type=str, default="gn")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--attention_resolutions", type=str, default="1", help="Resolutions for attention blocks")
 
-                for image_id in range(len(samples)):
-                    image = ((samples[image_id] + 1) / 2).clip(0, 1)
-                    torchvision.utils.save_image(image, f"{args.save_dir}/{label}-{image_id}.png")
-        else:
-            samples = diffusion.sample(args.num_images, device)
+    args = parser.parse_args()
 
-            for image_id in range(len(samples)):
-                image = ((samples[image_id] + 1) / 2).clip(0, 1)
-                torchvision.utils.save_image(image, f"{args.save_dir}/{image_id}.png")
-    except KeyboardInterrupt:
-        print("Keyboard interrupt, generation finished early")
+    args.channel_mults = tuple(map(int, args.channel_mults.split(',')))
+    args.attention_resolutions = tuple(map(int, args.attention_resolutions.split(',')))
+
+    print("="*40)
+    print("Starting Sampling with Quantized UNet")
+    print("="*40)
+    model = QATUNet(
+        img_channels=3, base_channels=args.base_channels, channel_mults=args.channel_mults,
+        num_res_blocks=args.num_res_blocks, time_emb_dim=args.time_emb_dim, time_emb_scale=1.0,
+        num_classes=10, dropout=args.dropout, attention_resolutions=args.attention_resolutions,
+        norm=args.norm, num_groups=32, initial_pad=0,
+    ).to(args.device)
+
+    # --- SETUP ---
+    model.set_quantize_weights(True)
+    model.set_quantize_activations(True)
+    betas = generate_linear_schedule(args.num_timesteps, low=1e-4, high=0.02)
+    diffusion = GaussianDiffusion(model, (32, 32), 3, 10, betas=betas, loss_type="l2").to(args.device)
+    
+    ## load pre-trained weights if available
+    if os.path.exists(args.save_path):
+        print(f"Loading pre-trained model from {args.save_path}")
+        model.load_state_dict(torch.load(args.save_path, map_location=args.device))
 
 
-def create_argparser():
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    defaults = dict(num_images=10000, device=device)
-    defaults.update(script_utils.diffusion_defaults())
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str)
-    parser.add_argument("--save_dir", type=str)
-    script_utils.add_dict_to_argparser(parser, defaults)
-    return parser
-
+    diffusion.ema_model.load_state_dict(model.state_dict())
+    labels_to_sample = torch.arange(10, device=args.device)
+    samples = diffusion.sample(batch_size=10, device=args.device, y=labels_to_sample, use_ema=True)
+    tv_utils.save_image(
+        samples,
+        "samples.png",
+        nrow=10,
+        normalize=True,
+        value_range=(-1, 1),
+    )
+    print("Sample images saved to 'samples.png'")
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <numeric>
 #include <algorithm>
+#include <random>
 // --- 模型数据结构 ---
 struct FloatLayer {
     std::vector<float> weights;
@@ -342,6 +343,17 @@ struct Tensor {
                     }
                 }
             }
+        }
+        return result;
+    }
+        static Tensor randn_like(const std::vector<size_t>& shape) {
+        Tensor result(shape);
+        // Use a random device for a better seed
+        std::mt19937 gen(std::random_device{}());
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+
+        for (size_t i = 0; i < result.data.size(); ++i) {
+            result.data[i] = dist(gen);
         }
         return result;
     }
