@@ -273,105 +273,112 @@ void standard_linear_forward(
     }
 }
 
-void im2col_binary(const Tensor& input, std::vector<uint32_t>& col_buffer,
-                   int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
-                   int out_h, int out_w) {
-    
+void im2col_ternary_packed(
+    const Tensor& input,
+    std::vector<uint32_t>& col_buffer_p, // p-bits for +1
+    std::vector<uint32_t>& col_buffer_n, // n-bits for -1
+    int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
+    int out_h, int out_w) {
+
     const int channels = input.shape[1];
     const int height = input.shape[2];
     const int width = input.shape[3];
     const int patch_size = channels * kernel_h * kernel_w;
     const int num_patches = out_h * out_w;
 
-    // col_buffer 将存储 [patch_size, num_patches] 的二值化矩阵
+    // col_buffer 将存储 [patch_size, num_patches] 的矩阵
     // 我们需要将 patch_size 向上取整到32的倍数，以便打包
-    const int patch_size_padded = (patch_size + 31) / 32;
-    col_buffer.assign(patch_size_padded * num_patches, 0);
+    const int patch_size_padded_words = (patch_size + 31) / 32;
+    col_buffer_p.assign(patch_size_padded_words * num_patches, 0);
+    col_buffer_n.assign(patch_size_padded_words * num_patches, 0);
 
     for (int patch_idx = 0; patch_idx < num_patches; ++patch_idx) {
         int h = patch_idx / out_w;
         int w = patch_idx % out_w;
-        
+
         // 当前 patch 在 col_buffer 中的起始位置
-        uint32_t* col_patch_ptr = col_buffer.data() + patch_idx * patch_size_padded;
+        uint32_t* col_patch_ptr_p = col_buffer_p.data() + patch_idx * patch_size_padded_words;
+        uint32_t* col_patch_ptr_n = col_buffer_n.data() + patch_idx * patch_size_padded_words;
 
-        int current_bit = 0;
-        uint32_t current_word = 0;
+        for (int bit_idx = 0; bit_idx < patch_size; ++bit_idx) {
+            // 计算当前 bit 对应的 c, kh, kw
+            int kw = bit_idx % kernel_w;
+            int kh = (bit_idx / kernel_w) % kernel_h;
+            int c_im = bit_idx / (kernel_h * kernel_w);
 
-        for (int c_im = 0; c_im < channels; ++c_im) {
-            for (int kh = 0; kh < kernel_h; ++kh) {
-                for (int kw = 0; kw < kernel_w; ++kw) {
-                    int h_pad = h * stride_h - pad_h + kh;
-                    int w_pad = w * stride_w - pad_w + kw;
+            int h_pad = h * stride_h - pad_h + kh;
+            int w_pad = w * stride_w - pad_w + kw;
 
-                    float val = 0.0f;
-                    if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
-                        val = input.data[c_im * (height * width) + h_pad * width + w_pad];
-                    }
-
-                    // 二值化激活值: > 0 编码为 1, <= 0 编码为 0
-                    // 这是 XNOR 运算的常见处理方式 (1<->+1, 0<->-1)
-                    if (val > 0) {
-                        current_word |= (1U << current_bit);
-                    }
-
-                    current_bit++;
-                    if (current_bit == 32) {
-                        *col_patch_ptr++ = current_word;
-                        current_bit = 0;
-                        current_word = 0;
-                    }
-                }
+            float val = 0.0f;
+            if (h_pad >= 0 && h_pad < height && w_pad >= 0 && w_pad < width) {
+                val = input.data[c_im * (height * width) + h_pad * width + w_pad];
             }
-        }
-        // 存储最后一个未满的 word
-        if (current_bit > 0) {
-            *col_patch_ptr = current_word;
+
+            // 三值化激活: round(clamp(x, -1, 1))
+            // 这与 Python 中的 ScaledActivationTernary 逻辑匹配
+            val = fmaxf(-1.0f, fminf(1.0f, val)); // Clamp
+            int8_t quantized_val = static_cast<int8_t>(round(val)); // Round
+
+            // 根据量化结果设置 p-bit 和 n-bit
+            int word_idx = bit_idx / 32;
+            int bit_in_word = bit_idx % 32;
+            if (quantized_val == 1) {
+                col_patch_ptr_p[word_idx] |= (1U << bit_in_word);
+            } else if (quantized_val == -1) {
+                col_patch_ptr_n[word_idx] |= (1U << bit_in_word);
+            }
         }
     }
 }
 
 
 // =====================================================================
-// ===== 核心优化 2: 基于位运算的 GEMM (gemm_binary_xnor) =====
-// 使用 XNOR 和 popcount 执行矩阵乘法
+// ===== 核心优化 2: 基于位运算的 GEMM (三值版本) =====
+// 使用 popcount 执行三值矩阵乘法
 // =====================================================================
-void gemm_binary_xnor(
-    const std::vector<uint32_t>& packed_weights, // A: [M x K_padded]
-    const std::vector<uint32_t>& packed_cols,    // B^T: [N x K_padded] (注意是转置的)
-    Tensor& C,                                   // C: [M x N]
+void gemm_ternary(
+    const std::vector<uint32_t>& weights_p, // W_p: [M x K_padded]
+    const std::vector<uint32_t>& weights_n, // W_n: [M x K_padded]
+    const std::vector<uint32_t>& cols_p,    // A_p: [N x K_padded] (转置)
+    const std::vector<uint32_t>& cols_n,    // A_n: [N x K_padded] (转置)
+    Tensor& C,
     const int M, const int N, const int K) {
 
-    const int K_padded_words = (K + 31) / 32; // K dimension in 32-bit words
+    const int K_padded_words = (K + 31) / 32;
     C.reshape({(size_t)M, (size_t)N});
     C.zero();
 
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
-            int acc = 0;
-            // 获取指向当前行(权重)和列(激活)的指针
-            const uint32_t* w_ptr = packed_weights.data() + i * K_padded_words;
-            const uint32_t* a_ptr = packed_cols.data() + j * K_padded_words;
+            int acc_pos = 0;
+            int acc_neg = 0;
+
+            const uint32_t* w_p_ptr = weights_p.data() + i * K_padded_words;
+            const uint32_t* w_n_ptr = weights_n.data() + i * K_padded_words;
+            const uint32_t* a_p_ptr = cols_p.data() + j * K_padded_words;
+            const uint32_t* a_n_ptr = cols_n.data() + j * K_padded_words;
 
             // 核心循环: 一次处理32个元素
             for (int k = 0; k < K_padded_words; ++k) {
-                uint32_t xnor_val = ~(w_ptr[k] ^ a_ptr[k]);
-                acc += _mm_popcnt_u32(xnor_val);
+                // 计算匹配项: (W_p & A_p) 和 (W_n & A_n)
+                acc_pos += _mm_popcnt_u32(w_p_ptr[k] & a_p_ptr[k]);
+                acc_pos += _mm_popcnt_u32(w_n_ptr[k] & a_n_ptr[k]);
+
+                // 计算不匹配项: (W_p & A_n) 和 (W_n & A_p)
+                acc_neg += _mm_popcnt_u32(w_p_ptr[k] & a_n_ptr[k]);
+                acc_neg += _mm_popcnt_u32(w_n_ptr[k] & a_p_ptr[k]);
             }
-            
-            // popcount 计算的是值为1的位的数量 (匹配的数量)
-            // 结果 = (匹配数) - (不匹配数) = popcount - (K - popcount) = 2*popcount - K
-            C.data[i * N + j] = static_cast<float>(2 * acc - K);
+
+            C.data[i * N + j] = static_cast<float>(acc_pos - acc_neg);
         }
     }
 }
 
-
 // =====================================================================
-// ===== 核心优化 3: 最终的 conv2d 函数 (使用位运算) =====
+// ===== 核心优化 3: 最终的 conv2d 函数 (三值位运算) =====
 // =====================================================================
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
-    PROFILE_SCOPE("conv2d_binary_xnor");
+    PROFILE_SCOPE("conv2d_ternary_popcount");
 
     const int B = input.shape[0];
     const int C_in = layer.in_channels;
@@ -381,40 +388,61 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int C_out = layer.out_channels;
     const int KH = layer.kernel_size_h;
     const int KW = layer.kernel_size_w;
-    
-    // 计算输出尺寸
+
     const int H_out = (H_in + 2 * layer.pad_h - KH) / layer.stride_h + 1;
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
-
-    // 准备输出张量和 im2col 缓冲区
-    Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
-    std::vector<uint32_t> col_buffer_binary;
 
     // 计算 GEMM 的维度
     const int M = C_out;
     const int N = H_out * W_out;
     const int K = C_in * KH * KW;
 
-    // 对 batch 中的每个样本执行卷积
+    // --- 新增: 从打包的权重中解包出 p-bits 和 n-bits ---
+    // Python 编码: 00 -> 0, 01 -> 1, 10 -> -1
+    const int K_padded_words = (K + 31) / 32;
+    std::vector<uint32_t> weights_p(M * K_padded_words, 0);
+    std::vector<uint32_t> weights_n(M * K_padded_words, 0);
+    
+    // 假设 layer.packed_weights 是 (M, K) 的 2-bit 打包权重
+    // 注意: 这个解包过程有一定开销，理想情况下 Python 转换脚本应直接提供 p/n 两个权重文件
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            int packed_word_idx = (m * K + k) / 16;
+            int bit_shift = ((m * K + k) % 16) * 2;
+            uint32_t two_bits = (layer.packed_weights[packed_word_idx] >> bit_shift) & 0x3;
+            
+            int out_word_idx = m * K_padded_words + k / 32;
+            int out_bit_idx = k % 32;
+
+            if (two_bits == 1) { // 值为 1
+                weights_p[out_word_idx] |= (1U << out_bit_idx);
+            } else if (two_bits == 2) { // 值为 -1
+                weights_n[out_word_idx] |= (1U << out_bit_idx);
+            }
+        }
+    }
+
+    Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
+    std::vector<uint32_t> col_buffer_p, col_buffer_n;
+
     for (int b = 0; b < B; ++b) {
-        Tensor input_sample = input.slice(b); 
+        Tensor input_sample = input.slice(b);
 
-        // 1. 将输入样本转换为二值化的列矩阵
-        im2col_binary(input_sample, col_buffer_binary, KH, KW, 
-                      layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out);
+        // 1. Im2Col: 将输入样本量化并打包为 p/n 位掩码
+        im2col_ternary_packed(input_sample, col_buffer_p, col_buffer_n, KH, KW,
+                              layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out);
 
-        // 2. 执行位运算矩阵乘法
-        // output_matrix = packed_weights * col_buffer_binary
+        // 2. GEMM: 执行三值位运算矩阵乘法
         Tensor output_matrix;
-        gemm_binary_xnor(layer.packed_weights, col_buffer_binary, output_matrix, M, N, K);
-        
-        // 3. 将结果缩放并复制到最终输出张量的对应位置
+        gemm_ternary(weights_p, weights_n, col_buffer_p, col_buffer_n, output_matrix, M, N, K);
+
+        // 3. 缩放并复制结果
         size_t batch_offset = b * M * N;
         for (size_t i = 0; i < M * N; ++i) {
             output.data[batch_offset + i] = output_matrix.data[i] * layer.alpha;
         }
     }
-    
+
     // 4. 添加偏置
     if (!layer.bias.empty()) {
         for (int b = 0; b < B; ++b) {
