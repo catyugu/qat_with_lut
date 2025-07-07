@@ -271,46 +271,62 @@ void standard_linear_forward(
         }
     }
 }
-void im2col_float(
-    const Tensor& input_sample,
+void im2col_float_robust(
+    const Tensor& input_batch, // 直接接收整个批处理张量
+    int b,                     // 以及当前处理的样本索引
     int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
     int out_h, int out_w,
     std::vector<float>& col_buffer // 输出浮点数的列缓冲
 ) {
-    PROFILE_SCOPE("im2col_float");
+    PROFILE_SCOPE("im2col_float_robust");
 
-    const int channels = input_sample.shape[1];
-    const int height = input_sample.shape[2];
-    const int width = input_sample.shape[3];
-    const int K = channels * kernel_h * kernel_w; // 列矩阵的“高度”
-    const int N = out_h * out_w;                   // 列矩阵的“宽度”
+    const int C_in = input_batch.shape[1];
+    const int H_in = input_batch.shape[2];
+    const int W_in = input_batch.shape[3];
+    const int K_gemm = C_in * kernel_h * kernel_w; // GEMM的K维度
+    const int N_gemm = out_h * out_w;              // GEMM的N维度
 
-    col_buffer.assign(K * N, 0.0f);
+    col_buffer.assign(K_gemm * N_gemm, 0.0f);
 
-    // 遍历每一个输出像素，为它构建一个列
-    for (int k = 0; k < K; ++k) {
-        const int kw = k % kernel_w;
-        const int kh = (k / kernel_w) % kernel_h;
-        const int c_im = k / (kernel_h * kernel_w);
-        
-        for (int n = 0; n < N; ++n) {
-            const int h_out = n / out_w;
-            const int w_out = n % out_w;
-            const int h_in = h_out * stride_h - pad_h + kh;
-            const int w_in = w_out * stride_w - pad_w + kw;
+    // 为手动索引预计算步长
+    const size_t batch_stride = C_in * H_in * W_in;
+    const size_t channel_stride = H_in * W_in;
+    const size_t height_stride = W_in;
 
-            if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
-                // 直接从输入张量中复制浮点值
-                col_buffer[k * N + n] = input_sample.at({0, (size_t)c_im, (size_t)h_in, (size_t)w_in});
+    // 获取指向当前批处理样本数据起点的指针
+    const float* input_data_ptr = input_batch.data.data() + b * batch_stride;
+
+    // 采用最优循环顺序 (C -> KH -> KW -> H_out -> W_out) 以最大化缓存命中率
+    for (int c = 0; c < C_in; ++c) {
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                // 这是在 col_buffer 中的行索引
+                const int k_gemm_row = c * (kernel_h * kernel_w) + kh * kernel_w + kw;
+
+                for (int h_out = 0; h_out < out_h; ++h_out) {
+                    const int h_in = h_out * stride_h - pad_h + kh;
+                    if (h_in < 0 || h_in >= H_in) continue; // 垂直方向的Padding检查
+
+                    for (int w_out = 0; w_out < out_w; ++w_out) {
+                        const int w_in = w_out * stride_w - pad_w + kw;
+                        if (w_in < 0 || w_in >= W_in) continue; // 水平方向的Padding检查
+                        
+                        // 这是在 col_buffer 中的列索引
+                        const int n_gemm_col = h_out * out_w + w_out;
+
+                        // 手动计算输入和输出的内存地址并直接赋值
+                        const size_t input_idx = c * channel_stride + h_in * height_stride + w_in;
+                        col_buffer[k_gemm_row * N_gemm + n_gemm_col] = input_data_ptr[input_idx];
+                    }
+                }
             }
-            // 对于 padding 区域，值保持为 0，无需操作
         }
     }
 }
 
 
 // =====================================================================
-// ===== 核心修正 2: 全新的非 LUT GEMM 内核 =====
+// ===== 核心修正 2: 全新的非 LUT GEMM 内核 (无变动) =====
 // 这个函数将 2-bit 打包的权重 (A) 与浮点数的 im2col 激活 (B) 相乘。
 // 它通过寄存器分块和 OpenMP 实现了高度优化。
 // =====================================================================
@@ -322,52 +338,30 @@ void gemm_packed_x_float_non_lut(
 ) {
     PROFILE_SCOPE("gemm_packed_x_float_non_lut");
 
-    // --- 定义寄存器块大小 ---
-    // 目标是让 C_tile 能够完全放入 CPU 寄存器
     const int REG_M = 8;
     const int REG_N = 6;
 
     for (int i = 0; i < M; i += REG_M) {
         for (int j = 0; j < N; j += REG_N) {
-            
-            // --- 微内核: 计算一个 REG_M x REG_N 的 C 块 ---
             float C_tile[REG_M][REG_N] = {0};
-
             for (int k = 0; k < K; ++k) {
-                // 1. 解包权重
-                const size_t weight_byte_idx = k / 4;
-                const size_t weight_bit_shift = (k % 4) * 2;
-                
-                // 2. 预加载 B 中的一行数据到寄存器
                 float b_vals[REG_N];
                 for(int jj=0; jj < REG_N; ++jj) {
-                    if (j + jj < N) {
-                       b_vals[jj] = B_float[k * N + (j + jj)];
-                    }
+                    if (j + jj < N) b_vals[jj] = B_float[k * N + (j + jj)];
                 }
-
-                // 3. 循环展开，最大化指令级并行
                 for (int ii = 0; ii < REG_M; ++ii) {
                     if (i + ii >= M) continue;
-
-                    // 解包一个三值权重: {-1, 0, 1}
+                    const size_t weight_byte_idx = k / 4;
+                    const size_t weight_bit_shift = (k % 4) * 2;
                     const uint8_t packed_byte = A_packed[(i + ii) * ((K + 3) / 4) + weight_byte_idx];
                     const uint8_t two_bit_val = (packed_byte >> weight_bit_shift) & 0x03;
                     const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
-
-                    // 如果权重为0，则跳过所有乘法
                     if (w == 0.0f) continue;
-
-                    // 将权重与预加载的 B 行数据相乘
                     for (int jj = 0; jj < REG_N; ++jj) {
-                        if (j + jj < N) {
-                            C_tile[ii][jj] += w * b_vals[jj];
-                        }
+                        if (j + jj < N) C_tile[ii][jj] += w * b_vals[jj];
                     }
                 }
             }
-
-            // --- 将计算完成的寄存器块写回主内存中的 C 矩阵 ---
             for (int ii = 0; ii < REG_M; ++ii) {
                 if (i + ii >= M) continue;
                 for (int jj = 0; jj < REG_N; ++jj) {
@@ -380,7 +374,7 @@ void gemm_packed_x_float_non_lut(
 }
 
 // =====================================================================
-// ===== 核心修正 3: 最终的 conv2d 函数 (统一逻辑) =====
+// ===== 核心修正 3: 最终的 conv2d 函数 (适配新的 im2col) =====
 // 将所有修正后的部分正确地组合在一起
 // =====================================================================
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
@@ -398,32 +392,25 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int H_out = (H_in + 2 * layer.pad_h - KH) / layer.stride_h + 1;
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
 
-    // 计算 GEMM 的维度
     const int M = C_out;
     const int N = H_out * W_out;
     const int K = C_in * KH * KW;
 
-    // 为 im2col 和 gemm 输出创建可复用的缓冲区
     std::vector<float> col_buffer(K * N);
     std::vector<float> gemm_output_buffer(M * N);
 
     Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
     
-    // 获取指向打包权重的指针
     const uint8_t* packed_weights_ptr = reinterpret_cast<const uint8_t*>(layer.packed_weights.data());
     
-    // 按批次处理
     for (int b = 0; b < B; ++b) {
-        // 从批处理中切片出单个样本
-        Tensor input_sample = input.slice(b);
-
-        // 1. Im2Col: 使用正确的浮点数版本
-        im2col_float(input_sample, KH, KW,
+        // 1. Im2Col: 调用全新的、更健壮的 im2col_float_robust
+        im2col_float_robust(input, b, KH, KW,
             layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out,
             col_buffer
         );
 
-        // 2. GEMM: 调用全新的、非 LUT 的高性能函数
+        // 2. GEMM: 调用高性能的非 LUT 函数 (无变动)
         gemm_packed_x_float_non_lut(
             packed_weights_ptr,
             col_buffer.data(),
@@ -431,11 +418,10 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
             M, N, K
         );
 
-        // 3. Col2Im: 将 GEMM 的结果重塑并添加偏置/缩放
+        // 3. Col2Im: 将结果重塑并添加偏置/缩放 (无变动)
         for (int c = 0; c < M; ++c) {
             const float bias = layer.bias.empty() ? 0.0f : layer.bias[c];
             for (int hw = 0; hw < N; ++hw) {
-                // 计算在最终输出张量中的索引
                 size_t out_idx = b * (M * N) + c * N + hw;
                 output.data[out_idx] = gemm_output_buffer[c * N + hw] * layer.alpha + bias;
             }
@@ -467,63 +453,72 @@ Tensor linear(const Tensor& input, const LinearLayer& layer) {
     return output;
 }
 
-Tensor group_norm(const Tensor& input, const GroupNormLayer& layer) {
-    PROFILE_SCOPE("group_norm_optimized"); // Use a new profiler scope to measure the improvement
+Tensor group_norm(
+    const Tensor& input_tensor, // 接收 const 引用
+    const GroupNormLayer& layer,
+    float eps = 1e-5f
+) {
+    PROFILE_SCOPE("group_norm_precise");
 
-    const auto& shape = input.shape;
-    size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
-    size_t G = layer.num_groups;
-    size_t C_per_group = C / G;
+    // 创建一个输出张量的副本，而不是在原地修改
+    Tensor output_tensor = input_tensor;
 
-    // Create the output tensor; we will write directly into it
-    Tensor output({B, C, H, W});
+    const size_t B = output_tensor.shape[0];
+    const size_t C = output_tensor.shape[1];
+    const size_t H = output_tensor.shape[2];
+    const size_t W = output_tensor.shape[3];
 
-    // Process each image in the batch
+    const size_t num_groups = layer.num_groups;
+    if (C % num_groups != 0) {
+        throw std::runtime_error("GroupNorm error: num_channels must be divisible by num_groups.");
+    }
+    const size_t channels_per_group = C / num_groups;
+    const size_t group_size = channels_per_group * H * W;
+
+    // 获取指向可学习参数的指针 (修正了 .data() 调用)
+    const float* gamma = layer.weight.data();
+    const float* beta = layer.bias.data();
+
+    // 按批次和分组进行处理
     for (size_t b = 0; b < B; ++b) {
-        // --- KEY IMPROVEMENT: Parallelize the loop over groups ---
-        // Each group can be processed independently on a separate CPU core.
-        for (size_t g = 0; g < G; ++g) {
-            // --- KEY IMPROVEMENT: Single-pass mean and variance calculation ---
-            // We calculate sum and sum-of-squares in a single loop to reduce memory access.
+        for (size_t g = 0; g < num_groups; ++g) {
+            // --- 1. 计算每个组的均值和方差 ---
             double sum = 0.0;
-            double sq_sum = 0.0;
-            const size_t group_size = C_per_group * H * W;
+            double sum_sq = 0.0;
+            
+            // 指向当前组的起始数据
+            float* group_data_start = output_tensor.data.data() + b * (C*H*W) + g * group_size;
 
-            for (size_t c = 0; c < C_per_group; ++c) {
-                const size_t channel_idx = g * C_per_group + c;
-                for (size_t h = 0; h < H; ++h) {
-                    for (size_t w = 0; w < W; ++w) {
-                        float val = input.at({b, channel_idx, h, w});
-                        sum += val;
-                        sq_sum += val * val;
-                    }
-                }
+            for (size_t i = 0; i < group_size; ++i) {
+                sum += group_data_start[i];
+                sum_sq += group_data_start[i] * group_data_start[i];
             }
 
             const float mean = static_cast<float>(sum / group_size);
-            const float var = static_cast<float>(sq_sum / group_size - mean * mean);
-            
-            // --- KEY IMPROVEMENT: Pre-calculate inverse std_dev ---
-            // Replaces expensive division with faster multiplication inside the loop.
-            const float inv_std_dev = 1.0f / std::sqrt(var + layer.eps);
+            const float var = static_cast<float>(sum_sq / group_size) - mean * mean;
+            const float std_dev_inv = 1.0f / std::sqrt(var + eps);
 
-            // Apply normalization, scaling (gamma), and shifting (beta)
-            for (size_t c = 0; c < C_per_group; ++c) {
-                const size_t channel_idx = g * C_per_group + c;
-                const float gamma = layer.weight[channel_idx]; // More descriptive name
-                const float beta = layer.bias[channel_idx];   // More descriptive name
+            // --- 2. 应用归一化和可学习参数 ---
+            for (size_t c_group = 0; c_group < channels_per_group; ++c_group) {
+                // 当前通道在整个张量中的绝对索引
+                const size_t c_abs = g * channels_per_group + c_group;
+                const float g_val = gamma[c_abs];
+                const float b_val = beta[c_abs];
 
-                for (size_t h = 0; h < H; ++h) {
-                    for (size_t w = 0; w < W; ++w) {
-                        const float normalized = (input.at({b, channel_idx, h, w}) - mean) * inv_std_dev;
-                        output.at({b, channel_idx, h, w}) = normalized * gamma + beta;
-                    }
+                // 指向当前通道的起始数据
+                float* channel_data_start = group_data_start + c_group * (H * W);
+
+                for (size_t hw = 0; hw < H * W; ++hw) {
+                    float& val = channel_data_start[hw];
+                    val = (val - mean) * std_dev_inv * g_val + b_val;
                 }
             }
         }
     }
-    return output;
+    // 返回修改后的副本
+    return output_tensor;
 }
+
 
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     PROFILE_SCOPE("attention_block");
@@ -710,8 +705,6 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
     return out;
 }
 
-
-#include <vector> // Ensure vector is included
 
 // 替换旧的 forward_qat_unet 函数
 Tensor forward_qat_unet(

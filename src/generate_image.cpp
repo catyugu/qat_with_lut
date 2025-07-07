@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "kernels.h"
 #include "stb_image_write.h"
+#include "profiler.h"
 
 // Defines all necessary diffusion coefficients
 struct DiffusionConstants {
@@ -89,6 +90,7 @@ int main(int argc, char* argv[]) {
 
         // 4. Denoising loop (from t=999 down to 0)
         std::cout << "Starting sampling for class " << class_label << "..." << std::endl;
+        Profiler::getInstance().reset(); 
         for (int t = num_timesteps - 1; t >= 0; --t) {
             std::cout << "Processing timestep " << t << "..." << std::endl;
             // Prepare time and class label tensors for the model
@@ -121,7 +123,7 @@ int main(int argc, char* argv[]) {
             }
         }
         std::cout << "Sampling complete." << std::endl;
-
+        Profiler::getInstance().report();
         // 5. Save the final generated image
         if (!save_image_from_float_array(output_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
             std::cerr << "Error: Failed to save the final image." << std::endl;

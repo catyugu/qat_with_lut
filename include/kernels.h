@@ -85,7 +85,11 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer);
 Tensor linear(const Tensor& input, const LinearLayer& layer);
 
 // Applies Group Normalization
-Tensor group_norm(const Tensor& input, const GroupNormLayer& layer);
+Tensor group_norm(
+    const Tensor& input_tensor, // 接收 const 引用
+    const GroupNormLayer& layer,
+    float eps
+);
 
 
 // --- Composite Block Kernels ---
