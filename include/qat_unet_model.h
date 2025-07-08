@@ -9,6 +9,17 @@
 #include <algorithm>
 #include "types.h" // Include this to get the Module base class and layer definitions
 
+struct DiffusionConstants {
+    int num_timesteps;
+    std::vector<float> betas;
+    std::vector<float> alphas_cumprod;
+    std::vector<float> alphas_cumprod_prev;
+    std::vector<float> sqrt_alphas_cumprod;
+    std::vector<float> sqrt_one_minus_alphas_cumprod;
+    std::vector<float> posterior_variance;
+    std::vector<float> posterior_mean_coef1;
+    std::vector<float> posterior_mean_coef2;
+};
 class QATUNetModel {
 public:
     // --- Hyperparameters ---
@@ -26,6 +37,8 @@ public:
     int initial_pad;
     bool use_scale_shift_norm;
 
+    DiffusionConstants diffusion_constants;
+    
     // --- Model Layers ---
     std::unique_ptr<PositionalEmbedding> time_mlp_pos_emb;
     std::unique_ptr<LinearLayer> time_mlp_linear1;

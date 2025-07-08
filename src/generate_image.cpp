@@ -1,108 +1,79 @@
-// src/generate_image.cpp
-// --- FINAL IMPLEMENTATION ---
-
 #include <iostream>
 #include <vector>
 #include <string>
 #include <random>
 #include <cmath>
 #include <stdexcept>
-#include <filesystem> // For creating directory
-#include <iomanip>    // For std::setfill, std::setw, std::fixed, std::setprecision
+#include <filesystem>
+#include <iomanip>
 #include "qat_unet_model.h"
 #include "utils.h"
 #include "kernels.h"
 #include "stb_image_write.h"
 #include "profiler.h"
 
-// --- Helper function to unpack and print weights ---
-void verify_final_conv_weights(const QATConv2dLayer& layer) {
-    if (layer.out_channels != 3) {
-        std::cerr << "Verification Error: final_conv is not producing 3 channels!" << std::endl;
-        return;
-    }
+// ===================================================================
+// 1. 重写的 DiffusionConstants 结构体和设置函数
+// ===================================================================
 
-    std::cout << "--- C++ Model: Final Convolution Layer Verification ---" << std::endl;
-    
-    // 1. 打印偏置 (Bias)
-    if (!layer.bias.empty()) {
-        std::cout << std::fixed << std::setprecision(8);
-        std::cout << "Bias (R, G, B): [" << layer.bias[0] << ", " << layer.bias[1] << ", " << layer.bias[2] << "]" << std::endl;
+Tensor randn_like(const std::vector<size_t>& shape, std::mt19937& generator) {
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    Tensor t(shape);
+    for (size_t i = 0; i < t.data.size(); ++i) {
+        t.data[i] = dist(generator);
     }
-
-    // 2. 解包并打印每个输出通道的前5个权重
-    const int K = layer.in_channels * layer.kernel_size_h * layer.kernel_size_w;
-    
-    for (int c_out = 0; c_out < 3; ++c_out) {
-        std::string channel_name = (c_out == 0) ? "RED" : ((c_out == 1) ? "GREEN" : "BLUE");
-        std::cout << "Weight for " << std::setw(5) << channel_name << " (Channel " << c_out << ", first 5): [";
-
-        for (int k = 0; k < 5; ++k) {
-            if (k >= K) break; // 防止越界
-            
-            // 手动执行与GEMM中完全相同的解包逻辑
-            const size_t weight_idx_flat = c_out * K + k;
-            const size_t packed_word_idx = weight_idx_flat / 16;
-            const uint32_t packed_word = layer.packed_weights[packed_word_idx];
-            const size_t inner_idx = weight_idx_flat % 16;
-            const size_t bit_shift = inner_idx * 2;
-            const uint8_t two_bit_val = (packed_word >> bit_shift) & 0x03;
-            const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
-            
-            std::cout << w << ((k == 4) ? "" : ", ");
-        }
-        std::cout << "]" << std::endl;
-    }
-    std::cout << "---------------------------------------------------------" << std::endl;
+    return t;
 }
-// Defines all necessary diffusion coefficients
-struct DiffusionConstants {
-    int num_timesteps;
-    std::vector<float> betas;
-    std::vector<float> alphas;
-    std::vector<float> alphas_cumprod;
-    std::vector<float> reciprocal_sqrt_alphas;
-    std::vector<float> remove_noise_coeff;
-    std::vector<float> sigma;
-};
 
-// Sets up diffusion constants to EXACTLY match Python's generate_linear_schedule and GaussianDiffusion
 DiffusionConstants setup_diffusion_constants(int timesteps, float beta_start = 0.0001f, float beta_end = 0.02f) {
     DiffusionConstants dc;
     dc.num_timesteps = timesteps;
 
-    // Linear schedule for betas
+    // 创建 betas
     dc.betas.resize(timesteps);
     for (int i = 0; i < timesteps; ++i) {
         dc.betas[i] = beta_start + (static_cast<float>(i) / static_cast<float>(timesteps - 1)) * (beta_end - beta_start);
     }
 
-    // Pre-calculate all other coefficients
-    dc.alphas.resize(timesteps);
+    // 预计算所有需要的系数
+    std::vector<float> alphas(timesteps);
+    for(int i = 0; i < timesteps; ++i) {
+        alphas[i] = 1.0f - dc.betas[i];
+    }
+
     dc.alphas_cumprod.resize(timesteps);
-    dc.reciprocal_sqrt_alphas.resize(timesteps);
-    dc.remove_noise_coeff.resize(timesteps);
-    dc.sigma.resize(timesteps);
+    dc.alphas_cumprod.front() = alphas.front();
+    for(int i = 1; i < timesteps; ++i) {
+        dc.alphas_cumprod[i] = dc.alphas_cumprod[i-1] * alphas[i];
+    }
 
-    float current_alpha_cumprod = 1.0f;
+    dc.alphas_cumprod_prev.resize(timesteps);
+    dc.alphas_cumprod_prev[0] = 1.0f; // 特殊情况 t=0
+    std::copy(dc.alphas_cumprod.begin(), dc.alphas_cumprod.end() - 1, dc.alphas_cumprod_prev.begin() + 1);
+
+    dc.sqrt_alphas_cumprod.resize(timesteps);
+    dc.sqrt_one_minus_alphas_cumprod.resize(timesteps);
+    dc.posterior_variance.resize(timesteps);
+    dc.posterior_mean_coef1.resize(timesteps);
+    dc.posterior_mean_coef2.resize(timesteps);
+
     for (int i = 0; i < timesteps; ++i) {
-        dc.alphas[i] = 1.0f - dc.betas[i];
-        current_alpha_cumprod *= dc.alphas[i];
-
-        dc.alphas_cumprod[i] = current_alpha_cumprod;
-        dc.reciprocal_sqrt_alphas[i] = 1.0f / std::sqrt(dc.alphas[i]);
-        dc.remove_noise_coeff[i] = dc.betas[i] / std::sqrt(1.0f - dc.alphas_cumprod[i]);
+        dc.sqrt_alphas_cumprod[i] = std::sqrt(dc.alphas_cumprod[i]);
+        dc.sqrt_one_minus_alphas_cumprod[i] = std::sqrt(1.0f - dc.alphas_cumprod[i]);
         
-        // Use posterior variance for sigma, which is sqrt(beta_t)
-        dc.sigma[i] = std::sqrt(dc.betas[i]);
+        // 后验方差: (1 - ᾱ_{t-1}) / (1 - ᾱ_t) * β_t
+        dc.posterior_variance[i] = (1.0f - dc.alphas_cumprod_prev[i]) / (1.0f - dc.alphas_cumprod[i]) * dc.betas[i];
+
+        // 后验均值系数1 (用于 pred_x0): sqrt(ᾱ_{t-1}) * β_t / (1 - ᾱ_t)
+        dc.posterior_mean_coef1[i] = std::sqrt(dc.alphas_cumprod_prev[i]) * dc.betas[i] / (1.0f - dc.alphas_cumprod[i]);
+
+        // 后验均值系数2 (用于 x_t): sqrt(α_t) * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
+        dc.posterior_mean_coef2[i] = std::sqrt(alphas[i]) * (1.0f - dc.alphas_cumprod_prev[i]) / (1.0f - dc.alphas_cumprod[i]);
     }
     return dc;
 }
 
-
-// =================================================================================
-// <<< NEW HELPER FUNCTION TO PRINT CHANNEL MEANS >>>
-// =================================================================================
+// (无需改动 verify_final_conv_weights 和 print_channel_means 函数)
 void print_channel_means(const Tensor& tensor, int timestep) {
     if (tensor.shape.size() != 4 || tensor.shape[1] != 3) {
         // Silently ignore if not a 3-channel image tensor
@@ -132,91 +103,81 @@ void print_channel_means(const Tensor& tensor, int timestep) {
 }
 
 
+
+// ===================================================================
+// 2. 重写的 main 函数
+// ===================================================================
+
 int main(int argc, char* argv[]) {
     if (argc != 5) {
         std::cerr << "Usage: " << argv[0] << " <path_to_ema_model.bin> <class_label> <num_timesteps> <output_image.png>" << std::endl;
         return 1;
     }
-
     std::string model_path = argv[1];
     int class_label = std::stoi(argv[2]);
     int num_timesteps = std::stoi(argv[3]);
-    std::string final_output_image_path = argv[4]; // Renamed for clarity
-
-    // Determine the base output directory for intermediate images
-    std::string output_dir = "output"; // Default directory
-    // If final_output_image_path contains a directory, use that as base for intermediate outputs
+    std::string final_output_image_path = argv[4];
+    
+    // (创建文件夹的逻辑无需改动)
+    std::string output_dir = "output";
     size_t last_slash_pos = final_output_image_path.find_last_of("/\\");
     if (last_slash_pos != std::string::npos) {
         output_dir = final_output_image_path.substr(0, last_slash_pos);
     }
-    output_dir += "/diffusion_steps"; // Create a subdirectory for step-by-step images
+    output_dir += "/diffusion_steps";
 
     try {
-        // Create the output directory if it doesn't exist
         if (!std::filesystem::exists(output_dir)) {
             std::filesystem::create_directories(output_dir);
-            std::cout << "Created directory: " << output_dir << std::endl;
         }
 
-        // 1. Load the UNet model (ensure this is from the EMA weights)
         QATUNetModel model;
         model.load_model(model_path);
         std::cout << "Successfully loaded EMA model." << std::endl;
 
-        verify_final_conv_weights(*model.final_conv);
-
-        // 2. Setup diffusion constants EXACTLY as in the Python script
         DiffusionConstants dc = setup_diffusion_constants(num_timesteps, 1e-4f, 0.02f);
         std::cout << "Diffusion constants set for " << num_timesteps << " timesteps." << std::endl;
 
-        // 3. Create initial random noise tensor (the starting point)
         std::mt19937 gen(std::random_device{}());
-        std::normal_distribution<float> dist(0.0f, 1.0f);
+        Tensor image_tensor = randn_like({1, (size_t)model.in_channels, (size_t)model.image_size, (size_t)model.image_size}, gen);
 
-        Tensor image_tensor({1, (size_t)model.in_channels, (size_t)model.image_size, (size_t)model.image_size});
-        for(size_t i = 0; i < image_tensor.data.size(); ++i) {
-            image_tensor.data[i] = dist(gen);
-        }
-
-        // 4. Denoising loop (from t=num_timesteps - 1 down to 0)
         std::cout << "Starting sampling for class " << class_label << "..." << std::endl;
-        Profiler::getInstance().reset(); 
+        
+        // --- 核心采样循环 (完全重写) ---
         for (int t = num_timesteps - 1; t >= 0; --t) {
             std::cout << "Processing timestep " << t << "..." << std::endl;
-            // Prepare time and class label tensors for the model
+            
             Tensor time_tensor({1});
             time_tensor.data[0] = static_cast<float>(t);
             Tensor class_tensor({1});
             class_tensor.data[0] = static_cast<float>(class_label);
-            // Predict noise using the UNet model
+
             Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor, class_tensor);
-            std::cout << "  [PREDICTED NOISE] ";
-            print_channel_means(predicted_noise, t);
-            // --- Core Denoising Logic (Mirrors python `remove_noise`) ---
-            // 1. Get coefficients for the current timestep t
-            float remove_coeff = dc.remove_noise_coeff[t];
-            float recip_sqrt_alpha = dc.reciprocal_sqrt_alphas[t];
+            
+            // 步骤 1: 预测去噪后的图像 pred_x0
+            // pred_x0 = (x_t - sqrt(1-ᾱ_t) * ε) / sqrt(ᾱ_t)
+            Tensor pred_x0_term1 = predicted_noise.mul_scalar(dc.sqrt_one_minus_alphas_cumprod[t]);
+            Tensor pred_x0_term2 = image_tensor.sub(pred_x0_term1);
+            Tensor pred_x0 = pred_x0_term2.mul_scalar(1.0f / dc.sqrt_alphas_cumprod[t]);
+            // (可选) 在这里对 pred_x0 进行 clamp 操作以增加稳定性
+            // pred_x0.clamp(-1.0f, 1.0f);
 
-            // 2. Calculate: x - coeff * predicted_noise
-            Tensor denoised_term = image_tensor.sub(predicted_noise.mul_scalar(remove_coeff));
+            // 步骤 2: 使用 pred_x0 计算 x_{t-1} 的均值
+            // posterior_mean = coef1 * pred_x0 + coef2 * x_t
+            Tensor posterior_mean_term1 = pred_x0.mul_scalar(dc.posterior_mean_coef1[t]);
+            Tensor posterior_mean_term2 = image_tensor.mul_scalar(dc.posterior_mean_coef2[t]);
+            Tensor posterior_mean = posterior_mean_term1.add(posterior_mean_term2);
 
-            // 3. Update image: (x - coeff * predicted_noise) / sqrt(alpha_t)
-            image_tensor = denoised_term.mul_scalar(recip_sqrt_alpha);
-            // --- End of Core Denoising Logic ---
-
-            // Add new noise if not the final step (t > 0)
+            // 步骤 3: 从后验分布中采样 x_{t-1}
             if (t > 0) {
-                float sigma_t = dc.sigma[t];
-                Tensor noise_tensor = Tensor::randn_like(image_tensor.shape); // Helper for random noise
-                image_tensor = image_tensor.add(noise_tensor.mul_scalar(sigma_t));
+                Tensor noise = randn_like(image_tensor.shape, gen);;
+                float std_dev = std::sqrt(dc.posterior_variance[t]);
+                image_tensor = posterior_mean.add(noise.mul_scalar(std_dev));
+            } else {
+                image_tensor = posterior_mean; // 最后一步是确定性的
             }
             
-            // =================================================================================
-            // <<< PRINT CHANNEL MEANS AFTER FULL UPDATE FOR THIS TIMESTEP >>>
-            // =================================================================================
             print_channel_means(image_tensor, t);
-
             // Save image every 10 diffusion steps, and at the last step (t=0)
             if ((num_timesteps - 1 - t) % 10 == 0 || t == 0) {
                 std::string step_image_filename = output_dir + "/step_" + std::to_string(num_timesteps - 1 - t) + ".png";

@@ -48,7 +48,43 @@ def pack_ternary_weights_definitive(original_weight_tensor):
         packed_data.append(packed_uint32)
         
     return packed_data
+def get_diffusion_coefficients(num_timesteps, beta_start=0.0001, beta_end=0.02):
+    """
+    Calculates all diffusion schedules needed for sampling, exactly matching
+    the logic required by the C++ implementation.
+    """
+    betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    
+    # alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), 'constant', 1.0)
+    # Correct way to pad for older PyTorch versions and for clarity
+    alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
 
+    # Coefficients for q(x_{t-1} | x_t, x_0)
+    posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+    
+    # Clamp variance to avoid division by zero
+    posterior_variance_clipped = torch.clamp(posterior_variance, min=1e-20)
+
+    # Coefficients for the mean of q(x_{t-1} | x_t, x_0)
+    posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+    posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+
+    # Coefficients for the forward process (needed for pred_x0)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+
+    return {
+        "betas": betas,
+        "alphas_cumprod": alphas_cumprod,
+        "alphas_cumprod_prev": alphas_cumprod_prev,
+        "sqrt_alphas_cumprod": sqrt_alphas_cumprod,
+        "sqrt_one_minus_alphas_cumprod": sqrt_one_minus_alphas_cumprod,
+        "posterior_variance": posterior_variance_clipped,
+        "posterior_mean_coef1": posterior_mean_coef1,
+        "posterior_mean_coef2": posterior_mean_coef2,
+    }
 def write_int(f, val): f.write(struct.pack('i', val))
 def write_float(f, val): f.write(struct.pack('f', val))
 def write_bool(f, val): f.write(struct.pack('?', val))
@@ -143,6 +179,7 @@ def main():
     config = { "img_channels": 3, "base_channels": 128, "channel_mults": [1, 2, 2, 2], "num_res_blocks": 2, "time_emb_dim": 512, "time_emb_scale": 1.0, "num_classes": 10, "dropout": 0.1, "attention_resolutions": [1], "norm": "gn", "num_groups": 32, "initial_pad": 0 }
     model_path = "qat_unet_final.pth" # Your final, non-EMA model
     output_path = "qat_unet_model_packed.bin"
+    num_timesteps = 1000
     
     model = QATUNet(**config)
     if not os.path.exists(model_path):
@@ -201,6 +238,26 @@ def main():
         print("\nExporting Final Layers..."); export_norm(f, model.out_norm); export_conv(f, model.out_conv)
 
         print("\n--- Export Complete ---")
+        print("\nCalculating and exporting diffusion coefficients...")
+        coeffs = get_diffusion_coefficients(num_timesteps)
+        
+        # Write number of timesteps first, so C++ knows array sizes
+        write_int(f, num_timesteps)
+        
+        # Write each coefficient array sequentially
+        # The order here MUST MATCH the reading order in C++
+        write_tensor(f, coeffs["betas"])
+        write_tensor(f, coeffs["alphas_cumprod"])
+        write_tensor(f, coeffs["alphas_cumprod_prev"])
+        write_tensor(f, coeffs["sqrt_alphas_cumprod"])
+        write_tensor(f, coeffs["sqrt_one_minus_alphas_cumprod"])
+        write_tensor(f, coeffs["posterior_variance"])
+        write_tensor(f, coeffs["posterior_mean_coef1"])
+        write_tensor(f, coeffs["posterior_mean_coef2"])
+        print("All diffusion coefficients have been written to the file.")
+
+        print("\n--- Export Complete ---")
+        print(f"Model and coefficients successfully exported to {output_path}")
         print(f"Model successfully exported to {output_path}")
 
 if __name__ == "__main__":

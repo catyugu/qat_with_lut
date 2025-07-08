@@ -313,4 +313,23 @@ void QATUNetModel::load_model(const std::string& model_path) {
     }
 
     std::cout << "\n--- Model Loading Complete ---" << std::endl;
+
+    read_from_file(file, this->diffusion_constants.num_timesteps, "num_timesteps");
+    read_vector(file, this->diffusion_constants.betas, "betas");
+    read_vector(file, this->diffusion_constants.alphas_cumprod, "alphas_cumprod");
+    read_vector(file, this->diffusion_constants.alphas_cumprod_prev, "alphas_cumprod_prev");
+    read_vector(file, this->diffusion_constants.sqrt_alphas_cumprod, "sqrt_alphas_cumprod");
+    read_vector(file, this->diffusion_constants.sqrt_one_minus_alphas_cumprod, "sqrt_one_minus_alphas_cumprod");
+    read_vector(file, this->diffusion_constants.posterior_variance, "posterior_variance");
+    read_vector(file, this->diffusion_constants.posterior_mean_coef1, "posterior_mean_coef1");
+    read_vector(file, this->diffusion_constants.posterior_mean_coef2, "posterior_mean_coef2");
+
+    // 作为一个临时的占位符（在你修改Python脚本前），你可以继续使用旧的计算方式
+    // 但最终的目标是替换掉它！
+    // 【临时代码，最终应删除】
+    // 为了让代码能编译，我们暂时保留计算逻辑，但请务必尽快替换为加载逻辑
+    // DiffusionConstants temp_dc = setup_diffusion_constants_placeholder(1000); // 假设1000个时间步
+    // this->diffusion_constants = temp_dc;
+    
+    std::cout << "Diffusion constants loaded/initialized." << std::endl;
 }
