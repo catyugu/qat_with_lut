@@ -1,5 +1,5 @@
 // src/generate_image.cpp
-// --- FULLY CORRECTED VERSION ---
+// --- FINAL IMPLEMENTATION ---
 
 #include <iostream>
 #include <vector>
@@ -7,6 +7,8 @@
 #include <random>
 #include <cmath>
 #include <stdexcept>
+#include <filesystem> // For creating directory
+#include <iomanip>    // For std::setfill, std::setw
 #include "qat_unet_model.h"
 #include "utils.h"
 #include "kernels.h"
@@ -67,9 +69,24 @@ int main(int argc, char* argv[]) {
     std::string model_path = argv[1];
     int class_label = std::stoi(argv[2]);
     int num_timesteps = std::stoi(argv[3]);
-    std::string output_path = argv[4];
+    std::string final_output_image_path = argv[4]; // Renamed for clarity
+
+    // Determine the base output directory for intermediate images
+    std::string output_dir = "output"; // Default directory
+    // If final_output_image_path contains a directory, use that as base for intermediate outputs
+    size_t last_slash_pos = final_output_image_path.find_last_of("/\\");
+    if (last_slash_pos != std::string::npos) {
+        output_dir = final_output_image_path.substr(0, last_slash_pos);
+    }
+    output_dir += "/diffusion_steps"; // Create a subdirectory for step-by-step images
 
     try {
+        // Create the output directory if it doesn't exist
+        if (!std::filesystem::exists(output_dir)) {
+            std::filesystem::create_directories(output_dir);
+            std::cout << "Created directory: " << output_dir << std::endl;
+        }
+
         // 1. Load the UNet model (ensure this is from the EMA weights)
         QATUNetModel model;
         model.load_model(model_path);
@@ -88,7 +105,7 @@ int main(int argc, char* argv[]) {
             image_tensor.data[i] = dist(gen);
         }
 
-        // 4. Denoising loop (from t=999 down to 0)
+        // 4. Denoising loop (from t=num_timesteps - 1 down to 0)
         std::cout << "Starting sampling for class " << class_label << "..." << std::endl;
         Profiler::getInstance().reset(); 
         for (int t = num_timesteps - 1; t >= 0; --t) {
@@ -113,21 +130,30 @@ int main(int argc, char* argv[]) {
             image_tensor = denoised_term.mul_scalar(recip_sqrt_alpha);
             // --- End of Core Denoising Logic ---
 
+            // Save image every 10 diffusion steps, and at the last step (t=0)
+            if ((num_timesteps - 1 - t) % 10 == 0 || t == 0) {
+                std::string step_image_filename = output_dir + "/step_" + std::to_string(num_timesteps - 1 - t) + ".png";
+                if (!save_image_from_float_array(step_image_filename, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
+                    std::cerr << "Error: Failed to save intermediate image for step " << (num_timesteps - 1 - t) << std::endl;
+                } else {
+                    std::cout << "Intermediate image saved to " << step_image_filename << std::endl;
+                }
+            }
             // Add new noise if not the final step (t > 0)
             if (t > 0) {
                 float sigma_t = dc.sigma[t];
                 Tensor noise_tensor = Tensor::randn_like(image_tensor.shape); // Helper for random noise
                 image_tensor = image_tensor.add(noise_tensor.mul_scalar(sigma_t));
             }
+
         }
         std::cout << "Sampling complete." << std::endl;
-        // Output all the tensors in image_tensor
-
+        
         Profiler::getInstance().report();
-        if (!save_image_from_float_array(output_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
+        if (!save_image_from_float_array(final_output_image_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
             std::cerr << "Error: Failed to save the final image." << std::endl;
         } else {
-            std::cout << "Image saved successfully to " << output_path << std::endl;
+            std::cout << "Final image saved successfully to " << final_output_image_path << std::endl;
         }
 
     } catch (const std::exception& e) {

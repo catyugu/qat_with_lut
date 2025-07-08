@@ -3,7 +3,7 @@ import torch.nn as nn
 import struct
 import numpy as np
 from ddpm.QAT_UNet import QATUNet, QATResidualBlock, AttentionBlock, Downsample, Upsample, QATConv2d, ScaledWeightTernary
-
+import os
 # --- Helper Functions ---
 
 # MODIFIED: Added alpha_val parameter
@@ -243,6 +243,11 @@ def main():
 
     print("Loading QAT UNet model...")
     model = QATUNet(**model_init_config)
+
+    # Check if the EMA model path exists
+    if not os.path.exists(model_path):
+        print(f"Error: EMA model not found at {model_path}. Please ensure your training script saves 'ema_model.pth'.")
+        return
 
     model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
     model.eval()

@@ -446,12 +446,12 @@ bool save_image_from_float_array(const std::string& filename, const std::vector<
 
                 // Scale from [-1, 1] to [0, 1] then to [0, 255]
                 float val_0_1 = (image_data[original_idx] + 1.0f) / 2.0f;
-                
-                // Scale to 0-255 and then clamp to ensure it's within valid byte range
-                float scaled_val_255 = val_0_1 * 255.0f;
-                reordered_pixel_data[new_idx] = static_cast<unsigned char>(
-                    std::round(std::max(0.0f, std::min(255.0f, scaled_val_255)))
-                );
+                float val_0_255 = val_0_1 * 255.0f; // Scale to [0, 255]
+
+                // Clamp the value to [0, 255] before rounding and casting
+                val_0_255 = std::max(0.0f, std::min(255.0f, val_0_255)); // Explicit clamping
+
+                reordered_pixel_data[new_idx] = static_cast<unsigned char>(std::round(val_0_255));
             }
         }
     }

@@ -628,7 +628,6 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     time_emb = silu(time_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear2);
     Tensor h = conv2d(x, *model.init_conv);
-    print_tensor_stats(h, "forward_qat_unet After conv_in"); 
 
     std::vector<Tensor> skips;
     skips.push_back(h);
@@ -659,6 +658,7 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     }
     h = group_norm(h, *model.final_norm);
     h = silu(h);
+    print_tensor_stats(h, "ResBlock1 After SiLU/Activation");
     h = conv2d(h, *model.final_conv);
 
     return h;
