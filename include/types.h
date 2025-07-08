@@ -212,69 +212,57 @@ struct Tensor {
     }
 
     Tensor add(const Tensor& other) const {
-        // Case 1: Element-wise Addition (Shapes are identical)
-        if (this->shape == other.shape) {
-            Tensor result(this->shape);
-            for (size_t i = 0; i < this->data.size(); ++i) {
-                result.data[i] = this->data[i] + other.data[i];
-            }
-            return result;
+        // This is the tensor we are adding the 'other' tensor to.
+        const Tensor& self = *this;
+
+        // --- Input Validation ---
+        if (self.shape.size() != 4 || (other.shape.size() != 4 && other.shape.size() != 1)) {
+            throw std::runtime_error("Add operation expects 4D tensors or a scalar.");
         }
 
-        // Case 2: 4D + 1D Broadcast (Conv2D bias: [B,C,H,W] + [C])
-        if (this->shape.size() == 4 && other.shape.size() == 1 && this->shape[1] == other.shape[0]) {
-            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
-            Tensor result(this->shape);
+        // Prepare the output tensor, starting as a copy of the base tensor.
+        Tensor result = self;
+
+        // --- Broadcasting Logic ---
+        // Check for the specific case: [B, C, H, W] + [B, C, 1, 1]
+        bool is_broadcast_add = (other.shape.size() == 4 &&
+                                self.shape[0] == other.shape[0] && // Batch matches
+                                self.shape[1] == other.shape[1] && // Channels match
+                                other.shape[2] == 1 &&              // H is 1
+                                other.shape[3] == 1);              // W is 1
+
+        const size_t B = self.shape[0];
+        const size_t C = self.shape[1];
+        const size_t H = self.shape[2];
+        const size_t W = self.shape[3];
+
+        if (is_broadcast_add) {
+            // Loop through each item in the batch
             for (size_t b = 0; b < B; ++b) {
+                // Loop through each channel
                 for (size_t c = 0; c < C; ++c) {
-                    const float bias_value = other.data[c];
+                    // Get the single bias value for this batch item and channel.
+                    float bias_value = other.at({b, c, 0, 0});
+
+                    // Add this single value to all pixels in the corresponding channel.
                     for (size_t hw = 0; hw < H * W; ++hw) {
-                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + bias_value;
+                        size_t h = hw / W;
+                        size_t w = hw % W;
+                        result.at({b, c, h, w}) += bias_value;
                     }
                 }
             }
-            return result;
+        } else if (self.shape == other.shape) {
+            // --- Standard Element-wise Addition ---
+            for (size_t i = 0; i < self.data.size(); ++i) {
+                result.data[i] += other.data[i];
+            }
+        } else {
+            // You may want to handle other broadcasting cases or throw an error.
+            throw std::runtime_error("Incompatible shapes for add operation.");
         }
 
-        // Case 3: 4D + 2D Broadcast (Time/Class embedding: [B,C,H,W] + [B,C])
-        if (this->shape.size() == 4 && other.shape.size() == 2 && this->shape[0] == other.shape[0] && this->shape[1] == other.shape[1]) {
-            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
-            Tensor result(this->shape);
-            for (size_t b = 0; b < B; ++b) {
-                for (size_t c = 0; c < C; ++c) {
-                    const float embedding_value = other.at({b, c});
-                    for (size_t hw = 0; hw < H * W; ++hw) {
-                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + embedding_value;
-                    }
-                }
-            }
-            return result;
-        }
-        
-        // ▼▼▼ NEWLY ADDED CASE ▼▼▼
-        // Case 4: 4D + 4D Broadcast (Residual connection: [B,C,H,W] + [B,C,1,1])
-        if (this->shape.size() == 4 && other.shape.size() == 4 &&
-            this->shape[0] == other.shape[0] && this->shape[1] == other.shape[1] &&
-            other.shape[2] == 1 && other.shape[3] == 1) {
-            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
-            Tensor result(this->shape);
-            for (size_t b = 0; b < B; ++b) {
-                for (size_t c = 0; c < C; ++c) {
-                    // The value from the [B, C, 1, 1] tensor is constant across the HxW plane.
-                    const float residual_value = other.at({b, c, 0, 0});
-                    for (size_t hw = 0; hw < H * W; ++hw) {
-                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + residual_value;
-                    }
-                }
-            }
-            return result;
-        }
-
-        // --- Diagnostic Block ---
-        std::cerr << "\n\nCRITICAL ERROR: Tensor::add encountered an unhandled broadcasting scenario.\n";
-        std::cerr << "  - Shape of 'this' tensor: " << shape_to_string(this->shape) << "\n";
-        std::cerr << "  - Shape of 'other' tensor: " << shape_to_string(other.shape) << "\n\n";
-        throw std::runtime_error("Tensor::add unsupported shapes for broadcasting.");
+        return result;
     }
     Tensor concat(const Tensor& other) const {
         if (this->shape.size() != 4 || other.shape.size() != 4) {
@@ -320,29 +308,23 @@ struct Tensor {
     }
 
     Tensor permute(const std::vector<int>& dims) const {
-        if (dims.size() != shape.size()) throw std::runtime_error("Permute dimensions mismatch.");
         std::vector<size_t> new_shape(shape.size());
         for (size_t i = 0; i < dims.size(); ++i) new_shape[i] = shape[dims[i]];
-        
         Tensor result(new_shape);
-        std::vector<size_t> old_indices(shape.size());
-        
-        std::function<void(size_t, size_t)> recurse = 
-            [&](size_t dim_idx, size_t current_offset) {
+        std::vector<size_t> current_indices(shape.size());
+        std::function<void(size_t)> recurse = [&](size_t dim_idx) {
             if (dim_idx == shape.size()) {
                 std::vector<size_t> new_indices(dims.size());
-                for(size_t i = 0; i < dims.size(); ++i) new_indices[i] = old_indices[dims[i]];
-                result.at(new_indices) = data[current_offset];
+                for (size_t i = 0; i < dims.size(); ++i) new_indices[i] = current_indices[dims[i]];
+                result.at(new_indices) = this->at(current_indices);
             } else {
-                size_t stride = 1;
-                for(size_t i = dim_idx + 1; i < shape.size(); ++i) stride *= shape[i];
-                for(size_t i = 0; i < shape[dim_idx]; ++i) {
-                    old_indices[dim_idx] = i;
-                    recurse(dim_idx + 1, current_offset + i * stride);
+                for (size_t i = 0; i < shape[dim_idx]; ++i) {
+                    current_indices[dim_idx] = i;
+                    recurse(dim_idx + 1);
                 }
             }
         };
-        recurse(0, 0);
+        recurse(0);
         return result;
     }
     Tensor transpose(size_t dim1, size_t dim2) const {
@@ -543,16 +525,9 @@ struct Tensor {
         return sliced_tensor;
     }
     Tensor view(const std::vector<size_t>& new_shape) const {
-        size_t new_numel = 1;
-        for (size_t dim : new_shape) {
-            new_numel *= dim;
-        }
-        if (new_numel != this->numel()) {
-            throw std::runtime_error("View error: number of elements must match.");
-        }
-        Tensor new_tensor(new_shape);
-        new_tensor.data = this->data; // 共享数据指针
-        return new_tensor;
+        Tensor result = *this;
+        result.reshape(new_shape);
+        return result;
     }
     Tensor interpolate(float scale_factor) const {
         if (shape.size() != 4) {
@@ -581,6 +556,54 @@ struct Tensor {
         }
         return output;
     }
+        Tensor bmm(const Tensor& other) const {
+        if (shape.size() != 3 || other.shape.size() != 3 || shape[0] != other.shape[0] || shape[2] != other.shape[1]) {
+            throw std::runtime_error("Invalid shapes for bmm.");
+        }
+        const size_t B = shape[0], M = shape[1], K = shape[2], N = other.shape[2];
+        Tensor result({B, M, N});
+        result.zero();
+        for (size_t b = 0; b < B; ++b) {
+            for (size_t m = 0; m < M; ++m) {
+                for (size_t n = 0; n < N; ++n) {
+                    for (size_t k = 0; k < K; ++k) {
+                        result.at({b, m, n}) += this->at({b, m, k}) * other.at({b, k, n});
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    Tensor softmax(int dim) const {
+        if (dim < 0) dim = shape.size() + dim;
+        Tensor result(this->shape);
+        size_t outer_size = 1;
+        for(int i=0; i<dim; ++i) outer_size *= shape[i];
+        size_t dim_size = shape[dim];
+        size_t inner_size = 1;
+        for(size_t i=dim+1; i<shape.size(); ++i) inner_size *= shape[i];
+
+        for(size_t i = 0; i < outer_size; ++i) {
+            for(size_t j = 0; j < inner_size; ++j) {
+                float max_val = -INFINITY;
+                for(size_t k=0; k<dim_size; ++k) {
+                    max_val = std::max(max_val, data[i*dim_size*inner_size + k*inner_size + j]);
+                }
+                float sum = 0.0f;
+                for(size_t k=0; k<dim_size; ++k) {
+                    float val = std::exp(data[i*dim_size*inner_size + k*inner_size + j] - max_val);
+                    result.data[i*dim_size*inner_size + k*inner_size + j] = val;
+                    sum += val;
+                }
+                for(size_t k=0; k<dim_size; ++k) {
+                    result.data[i*dim_size*inner_size + k*inner_size + j] /= sum;
+                }
+            }
+        }
+        return result;
+    }
+
     Tensor hadamard_transform() const {
     if (shape.size() != 4) {
         throw std::runtime_error("Hadamard transform only supports 4D tensors (B, C, H, W).");

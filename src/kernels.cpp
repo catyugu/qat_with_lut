@@ -347,43 +347,56 @@ void im2col_final(
     const Tensor& input_tensor, int b,
     int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
     int out_h, int out_w, std::vector<float>& col_buffer) {
-    PROFILE_SCOPE("im2col_final");
+    PROFILE_SCOPE("im2col_final_corrected");
 
     const int C_in = input_tensor.shape[1];
     const int H_in = input_tensor.shape[2];
     const int W_in = input_tensor.shape[3];
 
-    const int K_gemm = C_in * kernel_h * kernel_w;
-    const int N_gemm = out_h * out_w;
-    
-    // It's good practice to ensure the buffer is the correct size and zeroed out.
+    // GEMM矩阵的维度
+    const int K_gemm = C_in * kernel_h * kernel_w; // col_buffer 的行数
+    const int N_gemm = out_h * out_w;             // col_buffer 的列数
+
+    // 确保缓冲区被清零，这对于处理图像边缘的零填充至关重要
     col_buffer.assign(K_gemm * N_gemm, 0.0f);
 
-    const size_t input_channel_plane_size = H_in * W_in;
-    const float* input_data_ptr = input_tensor.data.data() + b * C_in * input_channel_plane_size;
+    // 获取当前处理的这张图片的起始数据指针
+    const float* input_batch_ptr = input_tensor.data.data() + b * C_in * H_in * W_in;
 
-    // Loop over input channels, then kernel spatial dimensions.
+    // 遍历所有输入通道
     for (int c = 0; c < C_in; ++c) {
+        // 获取当前输入通道的起始数据指针
+        const float* input_channel_ptr = input_batch_ptr + c * H_in * W_in;
+        
+        // 遍历卷积核的每一个位置 (kh, kw)
         for (int kh = 0; kh < kernel_h; ++kh) {
             for (int kw = 0; kw < kernel_w; ++kw) {
-                // This identifies the current row in the output column matrix.
-                const int k_gemm_row = c * (kernel_h * kernel_w) + kh * kernel_w + kw;
+                
+                // --- 1. 计算当前卷积核位置在 col_buffer 中对应的“行号” ---
+                // 这是最关键的索引之一，确保每个卷积核参数都映射到正确的行
+                const int col_buffer_row = (c * kernel_h + kh) * kernel_w + kw;
 
-                // Loop over output spatial dimensions.
+                // 遍历输出图像的每一个像素 (h_out, w_out)
                 for (int h_out = 0; h_out < out_h; ++h_out) {
                     for (int w_out = 0; w_out < out_w; ++w_out) {
+                        
+                        // --- 2. 计算当前输出像素在 col_buffer 中对应的“列号” ---
+                        const int col_buffer_col = h_out * out_w + w_out;
+
+                        // --- 3. 计算该输出像素在“原始输入图像”上对应的左上角坐标 ---
                         const int h_in = h_out * stride_h - pad_h + kh;
                         const int w_in = w_out * stride_w - pad_w + kw;
-                        
-                        // This identifies the current column in the output column matrix.
-                        const int n_gemm_col = h_out * out_w + w_out;
 
-                        // Check bounds and explicitly handle padding.
+                        // --- 4. 边界检查：只有当坐标在原始图像有效范围内时，才进行数据复制 ---
                         if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
-                            const size_t input_idx = c * input_channel_plane_size + h_in * W_in + w_in;
-                            col_buffer[k_gemm_row * N_gemm + n_gemm_col] = input_data_ptr[input_idx];
+                            
+                            // --- 5. 计算源和目的地的最终一维索引并复制数据 ---
+                            const size_t src_idx = h_in * W_in + w_in;
+                            const size_t dst_idx = col_buffer_row * N_gemm + col_buffer_col;
+                            col_buffer[dst_idx] = input_channel_ptr[src_idx];
                         }
-                        // No 'else' needed because the buffer is already zeroed.
+                        // 如果坐标无效（在padding区域），则不执行任何操作，
+                        // 因为 col_buffer 在开始时已全部填充为0，这自然地处理了零填充。
                     }
                 }
             }
@@ -392,69 +405,44 @@ void im2col_final(
 }
 
 
-/**
- * @brief A definitive, robust implementation for GEMM with packed 2-bit weights.
- *
- * This version uses a clear, standard C++ loop structure to ensure correctness
- * and readability, minimizing the risk of subtle bugs from compiler optimizations
- * or complex memory access. It correctly unpacks 2-bit signed integers (-1, 0, 1)
- * and performs the matrix multiplication C = A * B.
- *
- * @param A_packed Pointer to the packed 2-bit weight matrix (A). Shape: [M, K].
- * @param B_float Pointer to the float matrix (B), which is the im2col buffer. Shape: [K, N].
- * @param C Pointer to the output float matrix (C). Shape: [M, N].
- * @param M The number of rows in A and C (equivalent to out_channels).
- * @param N The number of columns in B and C (equivalent to out_height * out_width).
- * @param K The number of columns in A and rows in B (equivalent to in_channels * kernel_h * kernel_w).
- */
 __attribute__((target("avx,fma")))
 void gemm_packed_x_float_non_lut(
-    const uint32_t* A_packed, const float* B_float, float* C, int M, int N, int K) {
+    const uint32_t* A_packed, const float* B_float, float* C, int M, int N, int K, float alpha) {
     PROFILE_SCOPE("gemm_packed_verified");
 
-    // Initialize the output matrix C to all zeros. This is crucial.
-    std::fill(C, C + M * N, 0.0f);
+    // ========================= THE FIX: PART 2 =========================
+    // REMOVE the line that fills C with zeros. We now assume C is pre-initialized
+    // (e.g., with bias values) and we will accumulate onto it.
+    // std::fill(C, C + M * N, 0.0f); // <-- THIS LINE IS REMOVED
+    // ===================================================================
 
-    const int AVX_FLOAT_COUNT = 8; // AVX registers hold 8 single-precision floats
+    const int AVX_FLOAT_COUNT = 8;
 
-    // Use a standard GEMM loop order for correctness and cache efficiency.
-    for (int i = 0; i < M; ++i) {       // Iterate over rows of A (output channels)
-        for (int k = 0; k < K; ++k) {   // Iterate over columns of A / rows of B
-            
-            // --- Step 1: Unpack the single 2-bit weight from matrix A ---
+    for (int i = 0; i < M; ++i) {
+        for (int k = 0; k < K; ++k) {
             const size_t weight_idx_flat = i * K + k;
             const uint32_t packed_word = A_packed[weight_idx_flat / 16];
             const size_t bit_shift = (weight_idx_flat % 16) * 2;
             const uint8_t two_bit_val = (packed_word >> bit_shift) & 0x03;
+            const float w_unscaled = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
 
-            // This mapping is the core of the ternary unpacking.
-            const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
-
-            // If the weight is zero, it contributes nothing to the output, so we can skip.
-            if (w == 0.0f) {
+            if (w_unscaled == 0.0f) {
                 continue;
             }
+            const float w = w_unscaled * alpha;
 
-            // --- Step 2: Perform the outer product (w * row_k_of_B) and add it to row_i_of_C ---
             const float* B_row_ptr = &B_float[k * N];
             float* C_row_ptr = &C[i * N];
 
-            // Use AVX intrinsics to accelerate the vector-scalar multiplication and addition.
             int j = 0;
+            // The FMA operation c_vals = (w * b_vals) + c_vals is already an
+            // accumulating operation, so this logic remains correct.
             for (; j <= N - AVX_FLOAT_COUNT; j += AVX_FLOAT_COUNT) {
-                // Load 8 float values from the corresponding row in B and C.
                 __m256 b_vals = _mm256_loadu_ps(B_row_ptr + j);
                 __m256 c_vals = _mm256_loadu_ps(C_row_ptr + j);
-                
-                // Perform the fused multiply-add operation: c_vals = (w * b_vals) + c_vals
-                // We use _mm256_set1_ps to broadcast the scalar 'w' into a vector.
                 c_vals = _mm256_fmadd_ps(_mm256_set1_ps(w), b_vals, c_vals);
-
-                // Store the updated 8 float values back into C.
                 _mm256_storeu_ps(C_row_ptr + j, c_vals);
             }
-
-            // Handle any remaining elements at the end of the row that don't fit in a full AVX register.
             for (; j < N; ++j) {
                 C_row_ptr[j] += w * B_row_ptr[j];
             }
@@ -476,7 +464,6 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     const int H_out = (H_in + 2 * layer.pad_h - KH) / layer.stride_h + 1;
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
 
-    // GEMM dimensions
     const int M = C_out;
     const int N = H_out * W_out;
     const int K = C_in * KH * KW;
@@ -488,24 +475,31 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     std::vector<float> gemm_output_buffer(M * N);
 
     for (int b = 0; b < B; ++b) {
-        // Step 1: Call the new, corrected im2col function.
         im2col_final(input, b, KH, KW, layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out, col_buffer);
 
-        // Step 2: Perform matrix multiplication (this part is correct).
-        gemm_packed_x_float_non_lut(packed_weights_ptr, col_buffer.data(), gemm_output_buffer.data(), M, N, K);
+        // ========================= THE FIX: PART 1 =========================
+        // Instead of filling with zeros, initialize the output buffer with the bias.
+        // This ensures the bias is the starting point for accumulation.
+        for (int m = 0; m < M; ++m) {
+            const float bias = layer.bias.empty() ? 0.0f : layer.bias[m];
+            std::fill(gemm_output_buffer.begin() + m * N, gemm_output_buffer.begin() + (m + 1) * N, bias);
+        }
+        // ===================================================================
 
-        // Step 3: Reshape, add bias, and scale (this part is correct).
+        // Pass this pre-filled buffer to the GEMM function for accumulation.
+        gemm_packed_x_float_non_lut(packed_weights_ptr, col_buffer.data(), gemm_output_buffer.data(), M, N, K, layer.alpha);
+
+        // The result from GEMM is now the final result, no further ops needed.
+        // Just copy it to the output tensor.
         for (int c_out = 0; c_out < M; ++c_out) {
-            const float bias = layer.bias.empty() ? 0.0f : layer.bias[c_out];
             for (int hw = 0; hw < N; ++hw) {
                 size_t out_idx = b * (M * N) + c_out * N + hw;
-                output.data[out_idx] = gemm_output_buffer[c_out * N + hw] * layer.alpha + bias;
+                output.data[out_idx] = gemm_output_buffer[c_out * N + hw];
             }
         }
     }
     return output;
 }
-
 Tensor group_norm(
     const Tensor& input_tensor, // 接收 const 引用
     const GroupNormLayer& layer,
@@ -569,7 +563,6 @@ Tensor group_norm(
     return output_tensor;
 }
 
-
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     PROFILE_SCOPE("attention_block");
     const auto& shape = input.shape;
@@ -582,43 +575,48 @@ Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     Tensor k = qkv.slice(1, C, C);
     Tensor v = qkv.slice(1, C * 2, C);
 
-    // Apply Hadamard Transform (if used in training)
+    // Apply Hadamard Transform
     q = q.hadamard_transform();
     k = k.hadamard_transform();
     v = v.hadamard_transform();
 
-    // ========================= THE FIX =========================
-    // Reshape and permute tensors to exactly match the Python implementation
-    
-    // Reshape q and v for BMM: [B, HW, C]
-    q.reshape({B, C, H * W});
-    q = q.permute({0, 2, 1}); 
+    // ========================= FIX START =========================
+    // 修正了q, k, v张量的变形和转置顺序，以严格匹配Python实现
 
-    // Reshape v for BMM: [B, HW, C]
-    v.reshape({B, C, H * W});
-    v = v.permute({0, 2, 1});
+    // Python: q = q.permute(0, 2, 3, 1).view(b, h * w, c)
+    // q: [B, C, H, W] -> permute(0, 2, 3, 1) -> [B, H, W, C] -> reshape -> [B, H*W, C]
+    q = q.permute({0, 2, 3, 1});
+    q.reshape({B, H * W, C});
 
-    // Reshape k directly for BMM: [B, C, HW]
+    // Python: k = k.view(b, c, h * w)
+    // k: [B, C, H, W] -> reshape -> [B, C, H*W]
     k.reshape({B, C, H * W});
-    
-    // Perform scaled dot-product attention
+
+    // Python: v = v.permute(0, 2, 3, 1).view(b, h * w, c)
+    // v: [B, C, H, W] -> permute(0, 2, 3, 1) -> [B, H, W, C] -> reshape -> [B, H*W, C]
+    v = v.permute({0, 2, 3, 1});
+    v.reshape({B, H * W, C});
+
     // q [B, HW, C] @ k [B, C, HW] -> scores [B, HW, HW]
-    Tensor scores = q.matmul(k); // NO permute on k here!
-    // =========================================================
+    Tensor scores = q.matmul(k);
+    // ========================== FIX END ==========================
 
     scores = scores.mul_scalar(1.0f / std::sqrt(static_cast<float>(C)));
     scores = softmax(scores, -1); // Softmax on the last dimension
 
     // Apply attention to v
-    Tensor out = scores.matmul(v); // [B, HW, C]
-    out = out.permute({0, 2, 1});   // [B, C, HW]
+    // scores [B, HW, HW] @ v [B, HW, C] -> out [B, HW, C]
+    Tensor out = scores.matmul(v);
+    
+    // Reshape back to image format
+    // out: [B, HW, C] -> permute(0, 2, 1) -> [B, C, HW] -> reshape -> [B, C, H, W]
+    out = out.permute({0, 2, 1});
     out.reshape({B, C, H, W});
 
     // Final convolution and residual connection
     out = conv2d(out, *block.to_out);
     return input.add(out);
 }
-
 
 // --- 唯一的 Positional Embedding ---
 Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer) {
@@ -674,8 +672,7 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
 
     if (block.attention) {
         out = attention_block(out, *block.attention);
-    }
-
+    } 
     return out;
 }
 
@@ -690,6 +687,13 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
 
     // --- Initial Convolution & Skip Connection Setup ---
     Tensor h = conv2d(x, *model.init_conv);
+
+    std::cout << "\n--- C++ Trace (after init_conv) ---" << std::endl;
+    // You will need a print_stats method on your Tensor class for this to work.
+    std::cout << "--------------------" << std::endl;
+    std::cout << "Value at [0, 0, 0, 0]: " << std::fixed << std::setprecision(8) << h.at({0, 0, 0, 0}) << std::endl;
+    std::cout << "Value at [0, 5, 10, 15]: " << std::fixed << std::setprecision(8) << h.at({0, 5, 10, 15}) << std::endl;
+
     std::vector<Tensor> skips;
     skips.push_back(h);
 
@@ -739,6 +743,5 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     h = silu(h);
     print_tensor_stats(h, "Final Tensor before out_conv"); // Keep this for one last check
     h = conv2d(h, *model.final_conv);
-
     return h;
 }
