@@ -18,7 +18,7 @@ def pack_ternary_weights(tensor, alpha_val):
     num_chunks = (len(tensor_flat) + 15) // 16 # 每 16 个权重打包成一个 uint32
     
     # Define a small tolerance for floating-point comparisons
-    tolerance = 1e-5 # Weights might not be *exactly* alpha or -alpha due to float precision
+    tolerance = 1e-6 # Weights might not be *exactly* alpha or -alpha due to float precision
 
     for i in range(num_chunks):
         packed_uint32 = 0
