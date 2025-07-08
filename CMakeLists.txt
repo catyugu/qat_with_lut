@@ -71,6 +71,7 @@ add_executable(generate_image
 target_link_libraries(generate_image PRIVATE qat_core)
 
 add_executable(test_attention 
+    src/qat_unet_model.cpp
     src/test_attention.cpp
 )
 target_link_libraries(test_attention PRIVATE qat_core)

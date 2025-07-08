@@ -503,7 +503,7 @@ Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
 Tensor group_norm(
     const Tensor& input_tensor,
     const GroupNormLayer& layer,
-    float eps = 1e-5f
+    float eps = 1e-10f
 ) {
     PROFILE_SCOPE("group_norm_FINAL_FIX");
 
@@ -733,7 +733,7 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
 
     // --- 4. Final Output Layers ---
     // CRITICAL FIX: Add the missing 'eps' argument to group_norm.
-    h = group_norm(h, *model.final_norm, 1e-5f);
+    h = group_norm(h, *model.final_norm, 1e-10f);
     h = silu(h);
     print_tensor_stats(h, "Final Tensor before out_conv"); // Keep this for one last check
     h = conv2d(h, *model.final_conv);

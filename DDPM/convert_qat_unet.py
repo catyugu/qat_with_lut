@@ -176,7 +176,18 @@ def export_res_block(f, block):
 
 def main():
     # --- Model Configuration and Loading ---
-    config = { "img_channels": 3, "base_channels": 128, "channel_mults": [1, 2, 2, 2], "num_res_blocks": 2, "time_emb_dim": 512, "time_emb_scale": 1.0, "num_classes": 10, "dropout": 0.1, "attention_resolutions": [1], "norm": "gn", "num_groups": 32, "initial_pad": 0 }
+    config = { "img_channels": 3,
+              "base_channels": 128, 
+              "channel_mults": [1, 2, 2, 2],
+              "num_res_blocks": 2, 
+              "time_emb_dim": 512,
+              "time_emb_scale": 1.0, 
+              "num_classes": 10,
+              "dropout": 0.1,
+              "attention_resolutions": [1],
+              "norm": "gn", 
+              "num_groups": 32,
+              "initial_pad": 0 }
     model_path = "qat_unet_final.pth" # Your final, non-EMA model
     output_path = "qat_unet_model_packed.bin"
     num_timesteps = 1000
