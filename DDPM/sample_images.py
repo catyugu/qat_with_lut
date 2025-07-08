@@ -64,6 +64,7 @@ def main():
 
     diffusion.ema_model.load_state_dict(model.state_dict())
     labels_to_sample = torch.arange(10, device=args.device)
+    model.eval() 
     samples = diffusion.sample(batch_size=10, device=args.device, y=labels_to_sample, use_ema=True)
     tv_utils.save_image(
         samples,

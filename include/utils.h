@@ -89,5 +89,6 @@ bool save_image_from_float_array(const std::string& filename, const std::vector<
 
 // --- 其他通用工具函数 ---
 int argmax(const std::vector<float>& vec, int offset, int size);
+void print_tensor_stats(const Tensor& t, const std::string& name);
 
 #endif // UTILS_H

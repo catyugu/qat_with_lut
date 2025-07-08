@@ -528,3 +528,41 @@ for(size_t i = 0; i < outer_size; ++i) {
 
     return output;
 }
+void print_tensor_stats(const Tensor& t, const std::string& name) {
+    if (t.data.empty()) {
+        std::cout << name << ": (empty tensor)" << std::endl;
+        return;
+    }
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    float min_val = t.data[0];
+    float max_val = t.data[0];
+    bool has_nan = false;
+    bool has_inf = false;
+
+    for (float val : t.data) {
+        if (std::isnan(val)) has_nan = true;
+        if (std::isinf(val)) has_inf = true;
+        sum += val;
+        sum_sq += val * val;
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+    }
+
+    float mean = sum / t.data.size();
+    float std_dev = std::sqrt(sum_sq / t.data.size() - mean * mean);
+
+    std::cout << "--- Tensor: " << name << " ---" << std::endl;
+    std::cout << "  Shape: (";
+    for (size_t i = 0; i < t.shape.size(); ++i) {
+        std::cout << t.shape[i] << (i == t.shape.size() - 1 ? "" : ", ");
+    }
+    std::cout << ")" << std::endl;
+    std::cout << "  Mean: " << mean << std::endl;
+    std::cout << "  Std Dev: " << std_dev << std::endl;
+    std::cout << "  Min: " << min_val << std::endl;
+    std::cout << "  Max: " << max_val << std::endl;
+    if (has_nan) std::cout << "  *** CONTAINS NaN ***" << std::endl;
+    if (has_inf) std::cout << "  *** CONTAINS Inf ***" << std::endl;
+    std::cout << "--------------------" << std::endl;
+}

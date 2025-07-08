@@ -65,7 +65,7 @@ target_link_libraries(generate_image PRIVATE
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(myQATModel PRIVATE -mavx2 -Ofast )
     target_compile_options(speed_test PRIVATE -mavx2 -Ofast)
-    target_compile_options(generate_image PRIVATE -mavx2 -Ofast )
+    target_compile_options(generate_image PRIVATE -mavx2 -Ofast)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
     target_compile_options(myQATModel PRIVATE /arch:AVX2)
     target_compile_options(speed_test PRIVATE /arch:AVX2)

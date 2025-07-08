@@ -96,10 +96,8 @@ int main(int argc, char* argv[]) {
             // Prepare time and class label tensors for the model
             Tensor time_tensor({1});
             time_tensor.data[0] = static_cast<float>(t);
-
             Tensor class_tensor({1});
             class_tensor.data[0] = static_cast<float>(class_label);
-
             // Predict noise using the UNet model
             Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor, class_tensor);
 
@@ -123,6 +121,8 @@ int main(int argc, char* argv[]) {
             }
         }
         std::cout << "Sampling complete." << std::endl;
+        // Output all the tensors in image_tensor
+
         Profiler::getInstance().report();
         if (!save_image_from_float_array(output_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
             std::cerr << "Error: Failed to save the final image." << std::endl;

@@ -511,38 +511,6 @@ Tensor group_norm(
     return output_tensor;
 }
 
-Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResidualBlock& block) {
-    PROFILE_SCOPE("residual_block");
-    Tensor h = group_norm(input, *block.norm_1);
-    h = silu(h);
-    h = conv2d(h, *block.conv_1);
-
-    if (block.time_bias) {
-        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
-        time_bias.reshape({1, (size_t)block.conv_1->out_channels, 1, 1});
-        h = h.add(time_bias);
-    }
-
-    Tensor h2 = group_norm(h, *block.norm_2);
-    h2 = silu(h2);
-    h2 = conv2d(h2, *block.conv_2);
-
-    Tensor residual_conn = input;
-    if (block.residual_connection) {
-        residual_conn = conv2d(input, *block.residual_connection);
-    }
-
-    Tensor out = h2.add(residual_conn);
-
-    if (block.attention) {
-        out = attention_block(out, *block.attention);
-    }
-    
-    return out;
-}
-
-
-// In src/kernels.cpp
 
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     PROFILE_SCOPE("attention_block");
@@ -619,7 +587,8 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
     h = silu(h);
     h = conv2d(h, *block.conv_1);
     if (block.time_bias) {
-        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
+        Tensor silu_time_emb_output = silu(time_emb); // Capture the output of silu
+        Tensor time_bias = linear(silu_time_emb_output, *block.time_bias);
         time_bias.reshape({time_bias.shape[0], time_bias.shape[1], 1, 1});
         h = h.add(time_bias);
     }
@@ -644,9 +613,11 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
         residual_conn = conv2d(input, *block.residual_connection);
     }
     Tensor out = h2.add(residual_conn);
+
     if (block.attention) {
         out = attention_block(out, *block.attention);
     }
+
     return out;
 }
 
@@ -657,6 +628,7 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     time_emb = silu(time_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear2);
     Tensor h = conv2d(x, *model.init_conv);
+
     std::vector<Tensor> skips;
     skips.push_back(h);
     for (const auto& layer_ptr : model.downs) {
@@ -687,5 +659,6 @@ Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor
     h = group_norm(h, *model.final_norm);
     h = silu(h);
     h = conv2d(h, *model.final_conv);
+
     return h;
 }

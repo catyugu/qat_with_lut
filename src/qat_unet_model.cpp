@@ -64,6 +64,35 @@ void QATUNetModel::read_conv_layer(std::ifstream& file, QATConv2dLayer& layer) {
     read_from_file(file, bias_size, "conv.bias_size");
     layer.bias.resize(bias_size);
     read_vector(file, layer.bias, "conv.bias");
+    // --- ADD THESE DEBUG PRINTS ---
+    std::cout << "--- Debugging model.conv_in Parameters ---" << std::endl;
+    std::cout << "conv_in Alpha: " << layer.alpha << std::endl; // Check this value
+    std::cout << "conv_in Packed Weights Size: " << layer.packed_weights.size() << std::endl;
+    if (!layer.packed_weights.empty()) {
+        std::cout << "conv_in Packed Weights (first 5 uint32_t values): ";
+        for (int i = 0; i < std::min((int)layer.packed_weights.size(), 5); ++i) {
+            std::cout << layer.packed_weights[i] << " ";
+        }
+        std::cout << std::endl;
+
+        // Optionally, if you want to see the unpacked float values for more verification:
+        // (You'd need to adapt the 2-bit unpacking logic from gemm_packed_x_float_non_lut here)
+        // std::cout << "conv_in Unpacked Weights (first few floats): ";
+        // For demonstration, manually unpack one uint32_t to 16 floats (00->0, 01->1, 10->-1)
+        // You'd need a loop and the 2-bit logic from kernels.cpp
+        // For example:
+        // if (!model.conv_in.packed_weights.empty()) {
+        //     uint32_t first_packed_word = model.conv_in.packed_weights[0];
+        //     for (int shift = 0; shift < 32; shift += 2) {
+        //         uint32_t two_bit_val = (first_packed_word >> shift) & 0x03;
+        //         float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
+        //         std::cout << w << " ";
+        //     }
+        //     std::cout << std::endl;
+        // }
+    }
+    std::cout << "------------------------------------------" << std::endl;
+    // --- END DEBUG PRINTS ---
 }
 
 void QATUNetModel::read_linear_layer(std::ifstream& file, LinearLayer& layer) {
@@ -172,7 +201,9 @@ void QATUNetModel::load_model(const std::string& model_path) {
     // 1. Read Hyperparameters
     std::cout << "Reading Hyperparameters..." << std::endl;
     read_from_file(file, image_size, "image_size");
+    std::cout<<"Image size: " << image_size << std::endl;
     read_from_file(file, in_channels, "in_channels");
+    std::cout<<"In channels: " << in_channels << std::endl;
     read_from_file(file, base_channels, "base_channels");
     int channel_mults_size;
     read_from_file(file, channel_mults_size, "channel_mults_size");

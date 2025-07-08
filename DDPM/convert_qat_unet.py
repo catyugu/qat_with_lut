@@ -6,38 +6,44 @@ from ddpm.QAT_UNet import QATUNet, QATResidualBlock, AttentionBlock, Downsample,
 
 # --- Helper Functions ---
 
-def pack_ternary_weights(tensor):
+# MODIFIED: Added alpha_val parameter
+def pack_ternary_weights(tensor, alpha_val):
     """
-    将一个三值化的权重张量 (-1, 0, 1) 打包成一个 uint32_t 列表。
-    每个权重使用2个bit: 01 for +1, 10 for -1, 00 for 0.
+    将一个三值化的权重张量 (-alpha, 0, alpha) 打包成一个 uint32_t 列表。
+    每个权重使用2个bit: 01 for +1 (scaled by alpha), 10 for -1 (scaled by alpha), 00 for 0.
     """
-    # 确保张量在CPU上并且是平铺的
     tensor_flat = tensor.cpu().view(-1)
     
     packed_data = []
-    # 每 16 个权重打包成一个 uint32
-    num_chunks = (len(tensor_flat) + 15) // 16
+    num_chunks = (len(tensor_flat) + 15) // 16 # 每 16 个权重打包成一个 uint32
     
+    # Define a small tolerance for floating-point comparisons
+    tolerance = 1e-5 # Weights might not be *exactly* alpha or -alpha due to float precision
+
     for i in range(num_chunks):
         packed_uint32 = 0
         chunk = tensor_flat[i*16 : (i+1)*16]
         
-        for j, weight in enumerate(chunk):
+        for j, weight_val_scaled in enumerate(chunk):
             bits = 0
-            if weight.item() == 1.0:
-                bits = 1  # 01
-            elif weight.item() == -1.0:
-                bits = 2  # 10
-            # 如果是 0，bits 保持为 00
             
-            # 将2-bit的数据移到正确的位置并合并
+            # CORRECTED LOGIC: Compare with scaled alpha values
+            # The original 'weight.item()' in the loop was {-alpha, 0, +alpha}
+            # We need to determine if it conceptually represents -1, 0, or +1
+            if abs(weight_val_scaled.item() - alpha_val) < tolerance:
+                bits = 1  # 01 for +1 (i.e., +alpha)
+            elif abs(weight_val_scaled.item() + alpha_val) < tolerance:
+                bits = 2  # 10 for -1 (i.e., -alpha)
+            # If it's effectively 0, bits remains 0 (00)
+            
+            # 将2-bit的数据移到正确的位置并合并 (LSB to MSB packing)
             packed_uint32 |= (bits << (j * 2))
             
         packed_data.append(packed_uint32)
         
     return packed_data
 
-# Helper functions to write data to the binary file
+# Helper functions to write data to the binary file (unchanged)
 def write_int(f, val):
     f.write(struct.pack('i', val))
 
@@ -77,7 +83,7 @@ def export_conv(f, layer):
         weight = layer.weight.detach()
         bias = layer.bias.detach()
 
-        # Apply the custom ternary quantization to get {-1, 0, 1} float tensor
+        # Apply the custom ternary quantization to get {-alpha, 0, +alpha} float tensor
         quantized_weight_float = ScaledWeightTernary.apply(weight)
 
         # 1. Write scale (alpha)
@@ -85,7 +91,8 @@ def export_conv(f, layer):
         write_float(f, alpha)
 
         # 2. Pack the weights into a list of uint32_t
-        packed_data_uint32 = pack_ternary_weights(quantized_weight_float)
+        # MODIFIED: Pass alpha to pack_ternary_weights
+        packed_data_uint32 = pack_ternary_weights(quantized_weight_float, alpha)
         
         # 3. Write the original tensor shape for C++ to reconstruct the layout
         shape = weight.shape
@@ -101,51 +108,52 @@ def export_conv(f, layer):
         # 5. Write bias (unchanged)
         write_int(f, bias.numel())
         write_tensor(f, bias)
+        # Debug prints for model.conv_in (keep for verification after fix)
+        if layer.in_channels == 3 and layer.out_channels == 128 and layer.kernel_size == (3, 3):
+            print(f"\n--- Debugging quantized_weight_float for model.conv_in ---")
+            print(f"Shape: {quantized_weight_float.shape}")
+            print(f"Mean: {quantized_weight_float.mean().item()}")
+            print(f"Std Dev: {quantized_weight_float.std().item()}")
+            print(f"Min: {quantized_weight_float.min().item()}")
+            print(f"Max: {quantized_weight_float.max().item()}")
+            print(f"First 100 quantized_weight_float values (flat): {quantized_weight_float.view(-1)[:100].tolist()}")
+            # Add print for packed_data_uint32 after packing to confirm non-zeros
+            print(f"First 5 packed_data_uint32 values: {packed_data_uint32[:5]}")
+            print(f"--- End Debugging model.conv_in ---")
 
-    else: # Standard nn.Conv2d
+    else: # Standard nn.Conv2d (unchanged)
         print(f"  Exporting Float Conv2d: in={layer.in_channels}, out={layer.out_channels}")
         weight, bias = layer.weight.detach(), layer.bias.detach()
         
-        # For standard float conv, we still follow the new format for consistency
-        # 1. Write scale (alpha = 1.0 for float models)
-        write_float(f, 1.0) 
+        write_float(f, 1.0) # alpha = 1.0 for float models
         
-        # 2. Write shape
         shape = weight.shape
         write_int(f, len(shape))
         for dim_size in shape:
             write_int(f, dim_size)
 
-        # 3. Write data as a flat float array. We'll use a length prefix.
-        #    The C++ loader will see a non-packed format and load floats.
-        #    We will use a special flag, like packed_len = -1, to signify float data.
         write_int(f, -1) # Use -1 as a flag for "unpacked float data"
         write_int(f, weight.numel())
         write_tensor(f, weight)
         
-        # 4. Write bias
         write_int(f, bias.numel())
         write_tensor(f, bias)
 
-
+# --- Other Export Functions (unchanged) ---
 def export_linear(f, layer):
-    """Exports a Linear layer. Assumes it's always float for this model."""
     print(f"  Exporting Float Linear: in={layer.in_features}, out={layer.out_features}")
     weight, bias = layer.weight, layer.bias
 
     write_int(f, layer.in_features)
     write_int(f, layer.out_features)
 
-    # Export float weights
     write_int(f, weight.numel())
     write_tensor(f, weight)
 
-    # Export bias
     write_int(f, bias.numel())
     write_tensor(f, bias)
 
 def export_embedding(f, layer):
-    """Exports an nn.Embedding layer."""
     print(f"  Exporting Embedding: num_embeddings={layer.num_embeddings}, embedding_dim={layer.embedding_dim}")
     write_int(f, layer.num_embeddings)
     write_int(f, layer.embedding_dim)
@@ -153,7 +161,6 @@ def export_embedding(f, layer):
     write_tensor(f, layer.weight)
 
 def export_norm(f, layer):
-    """Exports a GroupNorm layer."""
     write_int(f, layer.num_groups)
     write_int(f, layer.num_channels)
     write_float(f, layer.eps)
@@ -164,46 +171,40 @@ def export_norm(f, layer):
     print(f"  Exported GroupNorm: groups={layer.num_groups}, channels={layer.num_channels}")
 
 def export_attention_block(f, block):
-    """Exports an AttentionBlock."""
     print("  Exporting Nested AttentionBlock...")
     export_norm(f, block.norm)
     export_conv(f, block.to_qkv)
     export_conv(f, block.to_out)
 
 def export_res_block(f, block):
-    """Exports a QATResidualBlock with flags for optional layers."""
     print("Exporting QATResidualBlock...")
     export_norm(f, block.norm_1)
     export_conv(f, block.conv_1)
 
-    # Export time_bias if it exists
     has_time_bias = block.time_bias is not None
     write_bool(f, has_time_bias)
     if has_time_bias:
         export_linear(f, block.time_bias)
 
-    # Export class_bias if it exists
     has_class_bias = block.class_bias is not None
     write_bool(f, has_class_bias)
     if has_class_bias:
         export_embedding(f, block.class_bias)
 
     export_norm(f, block.norm_2)
-    export_conv(f, block.conv_2[1]) # Access the QATConv2d within the nn.Sequential
+    export_conv(f, block.conv_2[1])
 
-    # Export residual_connection if it exists and is a Conv2d
     is_res_conv = isinstance(block.residual_connection, nn.Conv2d)
     write_bool(f, is_res_conv)
     if is_res_conv:
         export_conv(f, block.residual_connection)
 
-    # Export attention if it exists
     has_attention = isinstance(block.attention, AttentionBlock)
     write_bool(f, has_attention)
     if has_attention:
         export_attention_block(f, block.attention)
 
-# --- Main Export Logic ---
+# --- Main Export Logic (unchanged) ---
 
 def main():
     config = {
@@ -223,7 +224,7 @@ def main():
     }
 
     model_path = "qat_unet_final.pth"
-    output_path = "qat_unet_model_packed.bin" # Changed output name
+    output_path = "qat_unet_model_packed.bin"
 
     model_init_config = {
         "img_channels": config["in_channels"],
