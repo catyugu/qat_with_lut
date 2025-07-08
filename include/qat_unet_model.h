@@ -53,7 +53,7 @@ private:
     void read_linear_layer(std::ifstream& file, LinearLayer& layer);
     void read_norm_layer(std::ifstream& file, GroupNormLayer& layer);
     void read_attention_block(std::ifstream& file, AttentionBlock& block);
-    void read_res_block(std::ifstream& file, QATResidualBlock& block);
+    void read_res_block(std::ifstream& file, QATResidualBlock& block, int in_ch, int out_ch, bool use_attention);
 };
 
 

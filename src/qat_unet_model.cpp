@@ -1,3 +1,4 @@
+// src/qat_unet_model.cpp (修正版)
 #include "qat_unet_model.h"
 #include <iostream>
 #include <stdexcept>
@@ -100,16 +101,26 @@ void QATUNetModel::read_attention_block(std::ifstream& file, AttentionBlock& blo
     read_conv_layer(file, *block.to_out);
 }
 
-void QATUNetModel::read_res_block(std::ifstream& file, QATResidualBlock& block) {
-    std::cout << " Reading QATResidualBlock..." << std::endl;
+void QATUNetModel::read_res_block(std::ifstream& file, QATResidualBlock& block, int in_ch, int out_ch, bool use_attention) {
+    std::cout << " Reading QATResidualBlock (in=" << in_ch << ", out=" << out_ch << ")..." << std::endl;
+    
+    // norm_1
+    block.norm_1 = std::make_unique<GroupNormLayer>();
     read_norm_layer(file, *block.norm_1);
+
+    // conv_1
+    block.conv_1 = std::make_unique<QATConv2dLayer>();
     read_conv_layer(file, *block.conv_1);
+
+    // time_bias
     bool has_time_bias;
     read_from_file(file, has_time_bias, "res_block.has_time_bias");
     if (has_time_bias) {
         block.time_bias = std::make_unique<LinearLayer>();
         read_linear_layer(file, *block.time_bias);
     }
+
+    // class_bias
     bool has_class_bias;
     read_from_file(file, has_class_bias, "res_block.has_class_bias");
     if (has_class_bias) {
@@ -121,19 +132,32 @@ void QATUNetModel::read_res_block(std::ifstream& file, QATResidualBlock& block) 
         block.class_bias->weight.resize(weight_size);
         read_vector(file, block.class_bias->weight, "class_bias.weight");
     }
+
+    // norm_2
+    block.norm_2 = std::make_unique<GroupNormLayer>();
     read_norm_layer(file, *block.norm_2);
+
+    // conv_2 (part of a sequential block in python)
+    block.conv_2 = std::make_unique<QATConv2dLayer>();
     read_conv_layer(file, *block.conv_2);
+
+    // residual_connection
     bool has_residual_connection;
     read_from_file(file, has_residual_connection, "res_block.has_residual_connection");
-    if (block.residual_connection) {
+    if (has_residual_connection) {
+        block.residual_connection = std::make_unique<QATConv2dLayer>();
         read_conv_layer(file, *block.residual_connection);
     }
+
+    // attention
     bool has_attention;
     read_from_file(file, has_attention, "res_block.has_attention");
-    if (block.attention) {
+    if (has_attention) {
+        block.attention = std::make_unique<AttentionBlock>();
         read_attention_block(file, *block.attention);
     }
 }
+
 
 // --- Main Model Loading Logic ---
 
@@ -183,24 +207,30 @@ void QATUNetModel::load_model(const std::string& model_path) {
     read_conv_layer(file, *init_conv);
     std::cout << "Initial Convolution loaded." << std::endl;
 
-    // 4. Read Downsampling Path
+    // 4. Read Downsampling Path and collect skip channels
     std::cout << "\nReading Downsampling Path..." << std::endl;
+    std::vector<int> skip_channels_stack;
     int now_channels = base_channels;
     int current_res = image_size;
+
+    skip_channels_stack.push_back(now_channels);
+
     for (size_t i = 0; i < channel_mults.size(); ++i) {
         int out_channels = base_channels * channel_mults[i];
         for (int j = 0; j < num_res_blocks; ++j) {
             bool use_attention = (std::find(attention_resolutions.begin(), attention_resolutions.end(), current_res) != attention_resolutions.end());
             auto res_block = std::make_unique<QATResidualBlock>(now_channels, out_channels, time_emb_dim, use_attention);
-            read_res_block(file, *res_block);
+            read_res_block(file, *res_block, now_channels, out_channels, use_attention);
             downs.push_back(std::move(res_block));
             now_channels = out_channels;
+            skip_channels_stack.push_back(now_channels);
         }
         if (i != channel_mults.size() - 1) {
             auto downsample = std::make_unique<DownsampleLayer>();
             read_conv_layer(file, *downsample->conv);
             downs.push_back(std::move(downsample));
             current_res /= 2;
+            skip_channels_stack.push_back(now_channels);
         }
     }
     std::cout << "Downsampling Path loaded." << std::endl;
@@ -208,51 +238,24 @@ void QATUNetModel::load_model(const std::string& model_path) {
     // 5. Read Middle Path
     std::cout << "\nReading Middle Path..." << std::endl;
     middle_block1 = std::make_unique<QATResidualBlock>(now_channels, now_channels, time_emb_dim, true);
-    read_res_block(file, *middle_block1);
+    read_res_block(file, *middle_block1, now_channels, now_channels, true);
     middle_block2 = std::make_unique<QATResidualBlock>(now_channels, now_channels, time_emb_dim, false);
-    read_res_block(file, *middle_block2);
+    read_res_block(file, *middle_block2, now_channels, now_channels, false);
     std::cout << "Middle Path loaded." << std::endl;
 
     // 6. Read Upsampling Path
     std::cout << "\nReading Upsampling Path..." << std::endl;
-    std::vector<int> skip_connection_channels;
-    {
-        // FIXED: This logic now correctly mirrors the Python script's `channels` list creation.
-        int temp_now_ch = base_channels;
-        skip_connection_channels.push_back(temp_now_ch);
-        
-        for (size_t i = 0; i < channel_mults.size(); ++i) {
-            int temp_out_ch = base_channels * channel_mults[i];
-            for (int j = 0; j < num_res_blocks; ++j) {
-                // The python code appends the output channels of the res block
-                skip_connection_channels.push_back(temp_out_ch);
-            }
-            if (i != channel_mults.size() - 1) {
-                // After the downsample layer, the number of channels is still the output
-                // of the last res block in the level.
-                skip_connection_channels.push_back(temp_out_ch);
-            }
-        }
-    }
-    
-    std::cout << "[DEBUG] Initial skip connection channels count: " << skip_connection_channels.size() << std::endl;
-
     for (size_t i = 0; i < channel_mults.size(); ++i) {
         int level = channel_mults.size() - 1 - i;
         int out_channels = base_channels * channel_mults[level];
-        std::cout << "[DEBUG] Upsampling level " << level << ", out_channels: " << out_channels << std::endl;
         for (int j = 0; j < num_res_blocks + 1; ++j) {
-            int skip_ch = skip_connection_channels.back();
-            skip_connection_channels.pop_back();
+            int skip_ch = skip_channels_stack.back();
+            skip_channels_stack.pop_back();
             int in_channels_up = now_channels + skip_ch;
-            
-            std::cout << "[DEBUG]  ResBlock " << j << ": now_ch=" << now_channels << ", skip_ch=" << skip_ch 
-                      << ", in_ch_up=" << in_channels_up << ", out_ch=" << out_channels 
-                      << ", skips_left=" << skip_connection_channels.size() << std::endl;
 
             bool use_attention = (std::find(attention_resolutions.begin(), attention_resolutions.end(), current_res) != attention_resolutions.end());
             auto res_block = std::make_unique<QATResidualBlock>(in_channels_up, out_channels, time_emb_dim, use_attention);
-            read_res_block(file, *res_block);
+            read_res_block(file, *res_block, in_channels_up, out_channels, use_attention);
             ups.push_back(std::move(res_block));
             now_channels = out_channels;
         }

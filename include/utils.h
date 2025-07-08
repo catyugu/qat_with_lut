@@ -69,7 +69,7 @@ void silu(float* vec_ptr, size_t size); // Added SiLU declaration
 Tensor silu(const Tensor& input);
 
 // Applies the Softmax activation function along the last dimension
-Tensor softmax(const Tensor& input);
+Tensor softmax(const Tensor& input, int axis);
 
 // --- Data Transformation Functions ---
 // Declaration for im2col function

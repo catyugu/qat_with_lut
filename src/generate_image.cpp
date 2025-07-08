@@ -124,7 +124,6 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Sampling complete." << std::endl;
         Profiler::getInstance().report();
-        // 5. Save the final generated image
         if (!save_image_from_float_array(output_path, image_tensor.data, model.in_channels, model.image_size, model.image_size)) {
             std::cerr << "Error: Failed to save the final image." << std::endl;
         } else {

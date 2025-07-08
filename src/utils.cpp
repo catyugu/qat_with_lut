@@ -482,37 +482,49 @@ Tensor silu(const Tensor& input) {
 
 // Softmax function (numerically stable)
 // Applies softmax along the last dimension of the tensor
-Tensor softmax(const Tensor& input) {
-    Tensor output(input.shape);
-    
-    // Assuming the last dimension is the one to apply softmax over.
-    // E.g., for a shape of [B, H, W, C], softmax is over C.
-    size_t last_dim = input.shape.back();
-    size_t num_vectors = input.data.size() / last_dim;
-    for (size_t i = 0; i < num_vectors; ++i) {
-        const float* in_ptr = input.data.data() + i * last_dim;
-        float* out_ptr = output.data.data() + i * last_dim;
+Tensor softmax(const Tensor& input, int axis = -1) {
+Tensor output = input; // Create a copy
+auto& shape = output.shape;
 
-        // 1. Find max for numerical stability
-        float max_val = -FLT_MAX;
-        for (size_t j = 0; j < last_dim; ++j) {
-            if (in_ptr[j] > max_val) {
-                max_val = in_ptr[j];
+// Resolve negative axis
+if (axis < 0) {
+    axis += shape.size();
+}
+
+const size_t axis_dim = shape[axis];
+size_t outer_size = 1;
+for(int i = 0; i < axis; ++i) {
+    outer_size *= shape[i];
+}
+
+size_t inner_size = 1;
+for(int i = axis + 1; i < shape.size(); ++i) {
+    inner_size *= shape[i];
+}
+
+// Iterate over all dimensions except the softmax axis
+for(size_t i = 0; i < outer_size; ++i) {
+    for(size_t j = 0; j < inner_size; ++j) {
+            // --- Numerically Stable Softmax ---
+            // 1. Find the max value along the axis for stability
+            float max_val = -std::numeric_limits<float>::infinity();
+            for(size_t k = 0; k < axis_dim; ++k) {
+                max_val = std::max(max_val, output.data[i * axis_dim * inner_size + k * inner_size + j]);
+            }
+
+            // 2. Calculate the sum of exps
+            float sum_exp = 0.0f;
+            for(size_t k = 0; k < axis_dim; ++k) {
+                sum_exp += std::exp(output.data[i * axis_dim * inner_size + k * inner_size + j] - max_val);
+            }
+
+            // 3. Divide each element by the sum
+            for(size_t k = 0; k < axis_dim; ++k) {
+                float& val = output.data[i * axis_dim * inner_size + k * inner_size + j];
+                val = std::exp(val - max_val) / sum_exp;
             }
         }
-
-        // 2. Exp and sum
-        float sum_exp = 0.0f;
-        for (size_t j = 0; j < last_dim; ++j) {
-            float val = std::exp(in_ptr[j] - max_val);
-            out_ptr[j] = val; // Store temporarily
-            sum_exp += val;
-        }
-
-        // 3. Normalize
-        for (size_t j = 0; j < last_dim; ++j) {
-            out_ptr[j] /= sum_exp;
-        }
     }
+
     return output;
 }
