@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <functional>
 #include <random>
+#include <immintrin.h>
 // --- 模型数据结构 ---
 struct FloatLayer {
     std::vector<float> weights;
@@ -291,7 +292,6 @@ struct Tensor {
         throw std::runtime_error("Unsupported transpose dimensions");
     }
 
-// 在 Tensor 结构体中，找到并替换掉旧的 matmul 函数
     Tensor matmul(const Tensor& other) const {
 
         // --- Case 1: Batched Matrix Multiplication (3D x 3D) ---
@@ -350,7 +350,51 @@ struct Tensor {
         // --- Error Case: Unsupported shapes ---
         throw std::runtime_error("Matmul only supports 3D x 3D or 2D x 2D tensor multiplication.");
     }
-    
+    __attribute__((target("avx,fma")))
+    Tensor matmul(const float* other_data, size_t other_rows, size_t other_cols) const {
+        // This is a specialized matrix multiplication: Tensor * raw_float_array
+        if (shape.size() != 2 || shape[1] != other_rows) {
+            throw std::runtime_error("Matrix multiplication dimension mismatch for matmul with raw data.");
+        }
+
+        const size_t M = shape[0];         // Rows of this tensor
+        const size_t K = shape[1];         // Columns of this tensor
+        const size_t N = other_cols;     // Columns of the other matrix
+
+        Tensor output({M, N});
+        output.zero(); // Ensure the output is initialized to zero
+
+        const float* A_ptr = this->data.data(); // Pointer to this tensor's data
+        const float* B_ptr = other_data;        // Pointer to the raw float array
+        float* C_ptr = output.data.data();    // Pointer to the output data
+        
+        const int AVX_FLOAT_COUNT = 8;
+
+        // Perform matrix multiplication C = A * B
+        for (size_t i = 0; i < M; ++i) {
+            for (size_t k = 0; k < K; ++k) {
+                // Broadcast the single value from A
+                __m256 a_broadcast = _mm256_set1_ps(A_ptr[i * K + k]);
+                
+                // Multiply it by the corresponding row in B and add to the output row C
+                for (size_t j = 0; j < N; j += AVX_FLOAT_COUNT) {
+                    if (j + AVX_FLOAT_COUNT > N) { // Handle scalar remainder
+                        for(size_t j_offset = 0; j_offset < N - j; ++j_offset) {
+                            C_ptr[i * N + j + j_offset] += A_ptr[i * K + k] * B_ptr[k * N + j + j_offset];
+                        }
+                    } else { // Fast AVX path
+                        __m256 b_vals = _mm256_loadu_ps(&B_ptr[k * N + j]);
+                        __m256 c_vals = _mm256_loadu_ps(&C_ptr[i * N + j]);
+                        // Fused-Multiply-Add: C_vals += a_broadcast * b_vals
+                        c_vals = _mm256_fmadd_ps(a_broadcast, b_vals, c_vals);
+                        _mm256_storeu_ps(&C_ptr[i * N + j], c_vals);
+                    }
+                }
+            }
+        }
+        return output;
+    }
+        
     Tensor cat(const Tensor& other, size_t dim) const {
         if (dim != 1) throw std::runtime_error("Cat only implemented for channel dimension (1).");
         if (shape.size() != 4 || other.shape.size() != 4) throw std::runtime_error("Cat only implemented for 4D tensors.");
@@ -477,72 +521,73 @@ struct Tensor {
         return output;
     }
     Tensor hadamard_transform() const {
-        if (shape.size() != 4) {
-            throw std::runtime_error("Hadamard transform only supports 4D tensors (B, C, H, W).");
-        }
-        size_t C = shape[1];
-        if (C == 0) return *this;
+    if (shape.size() != 4) {
+        throw std::runtime_error("Hadamard transform only supports 4D tensors (B, C, H, W).");
+    }
 
-        size_t target_dim = 1;
-        while (target_dim < C) {
-            target_dim *= 2;
-        }
+    const size_t B = shape[0];
+    const size_t C = shape[1];
+    const size_t H = shape[2];
+    const size_t W = shape[3];
 
-        // --- FIX ---
-        // Explicitly declare the type of the recursive lambda
-        std::function<Tensor(size_t)> get_hadamard_matrix = 
-            [&](size_t n) -> Tensor {
-            if (n == 1) {
-                Tensor h({1, 1});
-                h.data[0] = 1.0f;
-                return h;
+    if (C == 0) return *this;
+
+    size_t target_dim = 1;
+    while (target_dim < C) {
+        target_dim *= 2;
+    }
+
+    // --- Generate Hadamard Matrix (more efficient) ---
+    std::vector<float> h_matrix(target_dim * target_dim);
+    h_matrix[0] = 1.0f;
+    for (size_t n = 1; n < target_dim; n *= 2) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < n; ++j) {
+                float val = h_matrix[i * n + j];
+                h_matrix[i * (n * 2) + (j + n)] = val;
+                h_matrix[(i + n) * (n * 2) + j] = val;
+                h_matrix[(i + n) * (n * 2) + (j + n)] = -val;
             }
-            // Now the recursive call is valid
-            Tensor h_half = get_hadamard_matrix(n / 2); 
-            Tensor h({n, n});
-            for(size_t i=0; i<n/2; ++i) {
-                for(size_t j=0; j<n/2; ++j) {
-                    float val = h_half.at({i, j});
-                    h.at({i, j}) = val;
-                    h.at({i, j + n/2}) = val;
-                    h.at({i + n/2, j}) = val;
-                    h.at({i + n/2, j + n/2}) = -val;
-                }
-            }
-            return h;
-        };
-        // --- END FIX ---
-
-        Tensor h_matrix = get_hadamard_matrix(target_dim);
-        h_matrix = h_matrix.mul_scalar(1.0f / std::sqrt(static_cast<float>(target_dim)));
-        
-        Tensor input_reshaped = this->permute({0, 2, 3, 1}).view({shape[0] * shape[2] * shape[3], C});
-
-        Tensor input_padded = input_reshaped;
-        if (C < target_dim) {
-            // NOTE: This padding logic is simplified. You might need to implement a
-            // proper `cat` or `pad` function in your Tensor class if this doesn't work.
-            Tensor padded_tensor({shape[0] * shape[2] * shape[3], target_dim});
-            padded_tensor.zero();
-            // Manually copy data
-            for(size_t i = 0; i < padded_tensor.shape[0]; ++i) {
-                for (size_t j = 0; j < C; ++j) {
-                    padded_tensor.at({i, j}) = input_reshaped.at({i, j});
-                }
-            }
-            input_padded = padded_tensor;
         }
-        input_padded.reshape({shape[0] * shape[2] * shape[3], target_dim});
+    }
+    float norm_factor = 1.0f / std::sqrt(static_cast<float>(target_dim));
+    for (float& val : h_matrix) {
+        val *= norm_factor;
+    }
 
-        Tensor transformed = input_padded.matmul(h_matrix.permute({1, 0})); // Transpose for matmul
-        
-        if (C < target_dim) {
-             // NOTE: Ensure your 'slice' can handle this column-wise slicing.
-             transformed = transformed.slice(1, 0, C); 
+    // ================== FIX FOR VOID CONVERSION ERROR ==================
+    // Break the chained calls. Assume permute() returns a new Tensor.
+    Tensor input_reshaped = this->permute({0, 2, 3, 1});
+    // Assume reshape() modifies the tensor in-place.
+    input_reshaped.reshape({B * H * W, C});
+    // =================================================================
+
+    // --- Padding Logic ---
+    Tensor input_padded = input_reshaped;
+    if (C < target_dim) {
+        input_padded = Tensor({B * H * W, target_dim});
+        input_padded.zero();
+        for (size_t i = 0; i < B * H * W; ++i) {
+            for (size_t j = 0; j < C; ++j) {
+                input_padded.at({i, j}) = input_reshaped.at({i, j});
+            }
         }
+    }
 
-        transformed.reshape({shape[0], shape[2], shape[3], C});
-        return transformed.permute({0, 3, 1, 2});
+    // ===================== FIX FOR MATMUL_RAW ======================
+    // Perform the matrix multiplication. Note the corrected function call.
+    // The h_matrix does NOT need to be permuted if matmul is implemented correctly.
+    Tensor transformed = input_padded.matmul(h_matrix.data(), target_dim, target_dim);
+    // =============================================================
+
+    // --- Slice and Reshape Back ---
+    if (C < target_dim) {
+        transformed = transformed.slice(1, 0, C); 
+    }
+    transformed.reshape({B, H, W, C});
+    
+    // Assume permute() returns a new Tensor.
+    return transformed.permute({0, 3, 1, 2});
     }
     
 };

@@ -345,49 +345,31 @@ Tensor linear(const Tensor& input, const LinearLayer& layer) {
 
 
 void im2col_float_robust(
-    const Tensor& input_batch, // 直接接收整个批处理张量
-    int b,                     // 以及当前处理的样本索引
+    const Tensor& input_batch, int b,
     int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w,
-    int out_h, int out_w,
-    std::vector<float>& col_buffer // 输出浮点数的列缓冲
-) {
+    int out_h, int out_w, std::vector<float>& col_buffer) {
     PROFILE_SCOPE("im2col_float_robust");
-
     const int C_in = input_batch.shape[1];
     const int H_in = input_batch.shape[2];
     const int W_in = input_batch.shape[3];
-    const int K_gemm = C_in * kernel_h * kernel_w; // GEMM的K维度
-    const int N_gemm = out_h * out_w;              // GEMM的N维度
-
+    const int K_gemm = C_in * kernel_h * kernel_w;
+    const int N_gemm = out_h * out_w;
     col_buffer.assign(K_gemm * N_gemm, 0.0f);
-
-    // 为手动索引预计算步长
     const size_t batch_stride = C_in * H_in * W_in;
     const size_t channel_stride = H_in * W_in;
     const size_t height_stride = W_in;
-
-    // 获取指向当前批处理样本数据起点的指针
     const float* input_data_ptr = input_batch.data.data() + b * batch_stride;
-
-    // 采用最优循环顺序 (C -> KH -> KW -> H_out -> W_out) 以最大化缓存命中率
     for (int c = 0; c < C_in; ++c) {
         for (int kh = 0; kh < kernel_h; ++kh) {
             for (int kw = 0; kw < kernel_w; ++kw) {
-                // 这是在 col_buffer 中的行索引
                 const int k_gemm_row = c * (kernel_h * kernel_w) + kh * kernel_w + kw;
-
                 for (int h_out = 0; h_out < out_h; ++h_out) {
                     const int h_in = h_out * stride_h - pad_h + kh;
-                    if (h_in < 0 || h_in >= H_in) continue; // 垂直方向的Padding检查
-
+                    if (h_in < 0 || h_in >= H_in) continue;
                     for (int w_out = 0; w_out < out_w; ++w_out) {
                         const int w_in = w_out * stride_w - pad_w + kw;
-                        if (w_in < 0 || w_in >= W_in) continue; // 水平方向的Padding检查
-                        
-                        // 这是在 col_buffer 中的列索引
+                        if (w_in < 0 || w_in >= W_in) continue;
                         const int n_gemm_col = h_out * out_w + w_out;
-
-                        // 手动计算输入和输出的内存地址并直接赋值
                         const size_t input_idx = c * channel_stride + h_in * height_stride + w_in;
                         col_buffer[k_gemm_row * N_gemm + n_gemm_col] = input_data_ptr[input_idx];
                     }
@@ -397,64 +379,25 @@ void im2col_float_robust(
     }
 }
 
-
-// =====================================================================
-// ===== 核心修正 2: 全新的非 LUT GEMM 内核 (无变动) =====
-// 这个函数将 2-bit 打包的权重 (A) 与浮点数的 im2col 激活 (B) 相乘。
-// 它通过寄存器分块和 OpenMP 实现了高度优化。
-// =====================================================================
-// In kernels.cpp
-
-// In src/kernels.cpp
 __attribute__((target("avx,fma")))
 void gemm_packed_x_float_non_lut(
-    const uint32_t* A_packed, // Weights (M, K), 2-bit packed in uint32_t
-    const float* B_float,     // Activations (K, N), float
-    float* C,                 // Output (M, N), float
-    int M, int N, int K
-) {
+    const uint32_t* A_packed, const float* B_float, float* C, int M, int N, int K) {
     PROFILE_SCOPE("gemm_packed_x_float_ger");
-
     const int AVX_FLOAT_COUNT = 8;
-    // Initialize output matrix C to all zeros for accumulation
-    for (int i = 0; i < M * N; ++i) {
-        C[i] = 0.0f;
-    }
-
-    // Outer loops iterate through the A matrix (weights)
+    for (int i = 0; i < M * N; ++i) { C[i] = 0.0f; }
     for (int i = 0; i < M; ++i) {
         for (int k = 0; k < K; ++k) {
-            
-            // ========================= THE FIX =========================
-            // This is the CORRECT unpacking logic matching your Python script.
-            
-            // 1. Calculate the flat index of the weight in the (M, K) matrix.
             const size_t weight_idx_flat = i * K + k;
-            
-            // 2. Find which uint32_t word contains our weight (16 weights per word).
             const size_t packed_word_idx = weight_idx_flat / 16;
             const uint32_t packed_word = A_packed[packed_word_idx];
-            
-            // 3. Find the 2-bit position of our weight inside that word.
             const size_t inner_idx = weight_idx_flat % 16;
             const size_t bit_shift = inner_idx * 2;
-
-            // 4. Extract the 2-bit value.
             const uint8_t two_bit_val = (packed_word >> bit_shift) & 0x03;
-            // =========================================================
-            
-            // Convert 2-bit value to float {-1, 0, 1}
-            // 01 -> 1, 10 -> -1, 00 -> 0
             const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
-
-            if (w == 0.0f) {
-                continue;
-            }
-
-            // --- Vector Part (unchanged) ---
+            if (w == 0.0f) continue;
             __m256 a_broadcast = _mm256_set1_ps(w);
             for (int j = 0; j < N; j += AVX_FLOAT_COUNT) {
-                 if (j + AVX_FLOAT_COUNT > N) { // Handle edge case where N is not a multiple of 8
+                 if (j + AVX_FLOAT_COUNT > N) {
                     for(int offset = 0; offset < N - j; ++offset) {
                         C[i * N + j + offset] += w * B_float[k * N + j + offset];
                     }
@@ -468,58 +411,29 @@ void gemm_packed_x_float_non_lut(
         }
     }
 }
-// =====================================================================
-// ===== 核心修正 3: 最终的 conv2d 函数 (适配新的 im2col) =====
-// 将所有修正后的部分正确地组合在一起
-// =====================================================================
-// In src/kernels.cpp
 
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer) {
     PROFILE_SCOPE("conv2d_ternary_optimized_single_core");
-
     const int B = input.shape[0];
     const int C_in = input.shape[1];
+    if (C_in != layer.in_channels) { throw std::runtime_error("Mismatched input channels in conv2d"); }
     const int H_in = input.shape[2];
     const int W_in = input.shape[3];
-    
-    // Sanity check
-    if (C_in != layer.in_channels) {
-        throw std::runtime_error("Mismatched input channels in conv2d");
-    }
-
     const int C_out = layer.out_channels;
     const int KH = layer.kernel_size_h;
     const int KW = layer.kernel_size_w;
-
     const int H_out = (H_in + 2 * layer.pad_h - KH) / layer.stride_h + 1;
     const int W_out = (W_in + 2 * layer.pad_w - KW) / layer.stride_w + 1;
-
     const int M = C_out;
     const int N = H_out * W_out;
     const int K = C_in * KH * KW;
-
     Tensor output({(size_t)B, (size_t)C_out, (size_t)H_out, (size_t)W_out});
-    
-    // ====================== THE FIX ======================
-    // Pass the pointer to the uint32_t data directly. No more reinterpret_cast.
     const uint32_t* packed_weights_ptr = layer.packed_weights.data();
-    // =====================================================
-    
     std::vector<float> col_buffer(K * N); 
     std::vector<float> gemm_output_buffer(M * N);
-
     for (int b = 0; b < B; ++b) {
         im2col_float_robust(input, b, KH, KW, layer.stride_h, layer.stride_w, layer.pad_h, layer.pad_w, H_out, W_out, col_buffer);
-
-        // Call the corrected GEMM function
-        gemm_packed_x_float_non_lut(
-            packed_weights_ptr,
-            col_buffer.data(),
-            gemm_output_buffer.data(),
-            M, N, K
-        );
-
-        // Dequantize the output using the alpha scale and add bias
+        gemm_packed_x_float_non_lut(packed_weights_ptr, col_buffer.data(), gemm_output_buffer.data(), M, N, K);
         for (int c = 0; c < M; ++c) {
             const float bias = layer.bias.empty() ? 0.0f : layer.bias[c];
             for (int hw = 0; hw < N; ++hw) {
@@ -627,115 +541,70 @@ Tensor residual_block(const Tensor& input, const Tensor& time_emb, const QATResi
     return out;
 }
 
+
+// In src/kernels.cpp
+
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     PROFILE_SCOPE("attention_block");
     const auto& shape = input.shape;
     size_t B = shape[0], C = shape[1], H = shape[2], W = shape[3];
 
     Tensor h = group_norm(input, *block.norm);
-    h = conv2d(h, *block.to_qkv); // qkv在一个卷积中计算
+    Tensor qkv = conv2d(h, *block.to_qkv);
 
-    // 切分 Q, K, V
-    Tensor q = h.slice(1, 0, C);
-    Tensor k = h.slice(1, C, C);
-    Tensor v = h.slice(1, C * 2, C);
+    Tensor q = qkv.slice(1, 0, C);
+    Tensor k = qkv.slice(1, C, C);
+    Tensor v = qkv.slice(1, C * 2, C);
 
-    // [新增] 如果您的模型使用了哈达玛变换，请保留
-    // q = q.hadamard_transform();
-    // k = k.hadamard_transform();
-    // v = v.hadamard_transform();
+    // Apply Hadamard Transform (if used in training)
+    q = q.hadamard_transform();
+    k = k.hadamard_transform();
+    v = v.hadamard_transform();
 
-    // Reshape 和 Permute 以进行矩阵乘法
-    q.reshape({B, C, H * W});
-    k.reshape({B, C, H * W});
-    v.reshape({B, C, H * W});
-
-    q = q.permute({0, 2, 1}); // [B, HW, C]
-    k = k.permute({0, 2, 1}); // [B, HW, C]
-    v = v.permute({0, 2, 1}); // [B, HW, C]
+    // ========================= THE FIX =========================
+    // Reshape and permute tensors to exactly match the Python implementation
     
-    // 计算注意力分数: (Q * K^T) / sqrt(d_k)
-    Tensor scores = q.matmul(k.permute({0, 2, 1})); // [B, HW, HW]
-    scores = scores.mul_scalar(1.0f / std::sqrt(static_cast<float>(C)));
-    scores = softmax(scores, -1); // 在最后一个维度应用 Softmax
+    // Reshape q and v for BMM: [B, HW, C]
+    q.reshape({B, C, H * W});
+    q = q.permute({0, 2, 1}); 
 
-    // 应用注意力分数到 V
+    // Reshape v for BMM: [B, HW, C]
+    v.reshape({B, C, H * W});
+    v = v.permute({0, 2, 1});
+
+    // Reshape k directly for BMM: [B, C, HW]
+    k.reshape({B, C, H * W});
+    
+    // Perform scaled dot-product attention
+    // q [B, HW, C] @ k [B, C, HW] -> scores [B, HW, HW]
+    Tensor scores = q.matmul(k); // NO permute on k here!
+    // =========================================================
+
+    scores = scores.mul_scalar(1.0f / std::sqrt(static_cast<float>(C)));
+    scores = softmax(scores, -1); // Softmax on the last dimension
+
+    // Apply attention to v
     Tensor out = scores.matmul(v); // [B, HW, C]
-    out = out.permute({0, 2, 1}); // [B, C, HW]
+    out = out.permute({0, 2, 1});   // [B, C, HW]
     out.reshape({B, C, H, W});
 
+    // Final convolution and residual connection
     out = conv2d(out, *block.to_out);
     return input.add(out);
 }
 
 
-// --- 统一且唯一的 Residual Block ---
-// 这个版本正确地处理时间嵌入和类别嵌入
-Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const Tensor& time_emb, const Tensor& y) {
-    PROFILE_SCOPE("residual_block");
-    
-    Tensor h = group_norm(input, *block.norm_1);
-    h = silu(h); // 应用SiLU激活
-    h = conv2d(h, *block.conv_1);
-
-    // 添加时间偏置
-    if (block.time_bias) {
-        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
-        time_bias.reshape({time_bias.shape[0], time_bias.shape[1], 1, 1}); // Reshape for broadcasting
-        h = h.add(time_bias);
-    }
-    
-    // 添加类别偏置
-    if (block.class_bias) {
-        int class_idx = static_cast<int>(y.data[0]);
-        int embedding_dim = block.class_bias->embedding_dim;
-        
-        Tensor class_bias_tensor({1, (size_t)embedding_dim});
-        const auto& weights = block.class_bias->weight;
-        
-        std::copy(weights.begin() + class_idx * embedding_dim,
-                  weights.begin() + (class_idx + 1) * embedding_dim,
-                  class_bias_tensor.data.begin());
-
-        class_bias_tensor.reshape({1, (size_t)embedding_dim, 1, 1}); // Reshape for broadcasting
-        h = h.add(class_bias_tensor);
-    }
-
-    // 第二部分
-    Tensor h2 = group_norm(h, *block.norm_2);
-    h2 = silu(h2);
-    h2 = conv2d(h2, *block.conv_2);
-    
-    // 残差连接
-    Tensor residual_conn = input;
-    if (block.residual_connection) {
-        residual_conn = conv2d(input, *block.residual_connection);
-    }
-    
-    Tensor out = h2.add(residual_conn);
-
-    // 注意力机制
-    if (block.attention) {
-        out = attention_block(out, *block.attention);
-    }
-    
-    return out;
-}
-
-
 // --- 唯一的 Positional Embedding ---
 Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer) {
+    PROFILE_SCOPE("positional_embedding");
     size_t B = time.shape[0];
     size_t dim = layer.dim;
     size_t half_dim = dim / 2;
-    
     Tensor output({B, dim});
-
     float log_10000 = std::log(10000.0f);
-
     for(size_t b = 0; b < B; ++b) {
         for(size_t i = 0; i < half_dim; ++i) {
-            float emb = std::exp(static_cast<float>(i) * -log_10000 / static_cast<float>(half_dim - 1));
+            float emb = std::exp(static_cast<float>(i) * -log_10000 / static_cast<float>(half_dim));
             float arg = time.data[b] * layer.time_emb_scale * emb;
             output.at({b, i}) = std::sin(arg);
             output.at({b, i + half_dim}) = std::cos(arg);
@@ -744,33 +613,54 @@ Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer
     return output;
 }
 
-// =====================================================================
-// ===== 核心修正 2: 统一并修正 UNet 的完整前向传播 =====
-// =====================================================================
+Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const Tensor& time_emb, const Tensor& y) {
+    PROFILE_SCOPE("residual_block");
+    Tensor h = group_norm(input, *block.norm_1);
+    h = silu(h);
+    h = conv2d(h, *block.conv_1);
+    if (block.time_bias) {
+        Tensor time_bias = linear(silu(time_emb), *block.time_bias);
+        time_bias.reshape({time_bias.shape[0], time_bias.shape[1], 1, 1});
+        h = h.add(time_bias);
+    }
+    if (block.class_bias) {
+        int class_idx = static_cast<int>(y.data[0]);
+        int embedding_dim = block.class_bias->embedding_dim;
+        Tensor class_bias_tensor({1, (size_t)embedding_dim});
+        const auto& weights = block.class_bias->weight;
+        std::copy(weights.begin() + class_idx * embedding_dim,
+                  weights.begin() + (class_idx + 1) * embedding_dim,
+                  class_bias_tensor.data.begin());
+        class_bias_tensor.reshape({1, (size_t)embedding_dim, 1, 1});
+        h = h.add(class_bias_tensor);
+    }
+    Tensor h2 = group_norm(h, *block.norm_2);
+    h2 = silu(h2);
+    // The dropout layer from Python is an identity op during inference,
+    // so we directly call the convolution here, which is correct.
+    h2 = conv2d(h2, *block.conv_2);
+    Tensor residual_conn = input;
+    if (block.residual_connection) {
+        residual_conn = conv2d(input, *block.residual_connection);
+    }
+    Tensor out = h2.add(residual_conn);
+    if (block.attention) {
+        out = attention_block(out, *block.attention);
+    }
+    return out;
+}
 
-Tensor forward_qat_unet(
-    const QATUNetModel& model,
-    const Tensor& x,
-    const Tensor& time,
-    const Tensor& y // <--- 必须传入类别标签 y
-) {
+Tensor forward_qat_unet(const QATUNetModel& model, const Tensor& x, const Tensor& time, const Tensor& y) {
     PROFILE_SCOPE("forward_qat_unet_final");
-
-    // 1. 时间嵌入
     Tensor time_emb = positional_embedding(time, *model.time_mlp_pos_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear1);
     time_emb = silu(time_emb);
     time_emb = linear(time_emb, *model.time_mlp_linear2);
-
-    // 2. 初始卷积
     Tensor h = conv2d(x, *model.init_conv);
     std::vector<Tensor> skips;
     skips.push_back(h);
-
-    // 3. 下采样路径 (Encoder)
     for (const auto& layer_ptr : model.downs) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
-            // **调用正确的、接收 y 的 residual_block**
             h = residual_block(h, *res_block, time_emb, y);
         } else if (auto* downsample_block = dynamic_cast<DownsampleLayer*>(layer_ptr.get())) {
             h = conv2d(h, *downsample_block->conv);
@@ -779,31 +669,23 @@ Tensor forward_qat_unet(
         }
         skips.push_back(h);
     }
-
-    // 4. 中间路径
     h = residual_block(h, *model.middle_block1, time_emb, y);
     h = residual_block(h, *model.middle_block2, time_emb, y);
-
-    // 5. 上采样路径 (Decoder)
     for (const auto& layer_ptr : model.ups) {
         if (auto* res_block = dynamic_cast<QATResidualBlock*>(layer_ptr.get())) {
             Tensor skip = skips.back();
             skips.pop_back();
             h = h.cat(skip, 1); 
-            // **调用正确的、接收 y 的 residual_block**
             h = residual_block(h, *res_block, time_emb, y);
         } else if (auto* upsample_block = dynamic_cast<UpsampleLayer*>(layer_ptr.get())) {
-            h = h.upsample(2); // 确保您的 Tensor 类有 upsample 方法
+            h = h.upsample(2);
             h = conv2d(h, *upsample_block->conv);
         } else {
             throw std::runtime_error("Unknown layer type in ups");
         }
     }
-
-    // 6. 最终输出层
     h = group_norm(h, *model.final_norm);
     h = silu(h);
     h = conv2d(h, *model.final_conv);
-
     return h;
 }
