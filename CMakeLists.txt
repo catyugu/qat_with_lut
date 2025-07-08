@@ -1,73 +1,71 @@
-# Set the minimum required version of CMake and project name
+# 设置CMake最低版本和项目名称
 cmake_minimum_required(VERSION 3.14)
 project(myQATModel CXX C)
 
-# --- Find and set required packages ---
+# --- 查找并设置必要的包 ---
 find_package(Threads REQUIRED)
-find_package(OpenMP REQUIRED) # Add this line
-# --- Set C++ standard ---
+find_package(OpenMP REQUIRED)
+
+# --- 设置C++标准 ---
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set the output directory for executables
+# 设置可执行文件的输出目录
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# Enable high-performance kernels for x86 CPUs
-add_compile_definitions(GGML_BITNET_X86_TL2)
-add_compile_definitions(GGML_BITNET_X86_AVX2)
-#add_compile_definitions(GGML_BITNET_X86_AVX512)
-
-# --- Build the main application ---
-add_executable(myQATModel
-        src/main.cpp
-        src/types.cpp
-        src/utils.cpp
-        src/kernels.cpp
-        src/profiler.cpp
+#-----------------------------------------------------------------------------
+# 1. 为所有目标共享的通用代码创建一个静态库 ⚙️
+#-----------------------------------------------------------------------------
+add_library(qat_core STATIC
+    src/types.cpp
+    src/utils.cpp
+    src/kernels.cpp
+    src/profiler.cpp
 )
 
-target_include_directories(myQATModel PUBLIC include)
-# --- Link libraries ---
-# Link our main application against all required libraries
-target_link_libraries(myQATModel PRIVATE
-        Threads::Threads  # Threads library
-        OpenMP::OpenMP_CXX # Add this line
+# 为核心库设置PUBLIC属性，这样链接到它的目标会自动继承这些设置
+target_include_directories(qat_core PUBLIC 
+    include
 )
 
-# --- Build the new speed test executable ---
-add_executable(speed_test
-        src/speed_test.cpp
-        src/types.cpp
-        src/utils.cpp
-        src/kernels.cpp
-        src/profiler.cpp
-)
-add_executable(generate_image 
-        src/generate_image.cpp
-        src/qat_unet_model.cpp
-        src/kernels.cpp 
-        src/types.cpp
-        src/utils.cpp
-        src/profiler.cpp
-        )
-target_include_directories(speed_test PUBLIC include)
-target_include_directories(generate_image PUBLIC include)
-
-target_link_libraries(speed_test PRIVATE
-        Threads::Threads
-        OpenMP::OpenMP_CXX
-)
-target_link_libraries(generate_image PRIVATE
-        Threads::Threads
-        OpenMP::OpenMP_CXX
+target_compile_definitions(qat_core PUBLIC
+    GGML_BITNET_X86_TL2
+    GGML_BITNET_X86_AVX2
+    #GGML_BITNET_X86_AVX512
 )
 
+target_link_libraries(qat_core PUBLIC
+    Threads::Threads
+    OpenMP::OpenMP_CXX
+)
+
+# 将编译器特定优化选项也应用到核心库
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(myQATModel PRIVATE -mavx2 -Ofast )
-    target_compile_options(speed_test PRIVATE -mavx2 -Ofast)
-    target_compile_options(generate_image PRIVATE -mavx2 -Ofast)
+    target_compile_options(qat_core PUBLIC -mavx2 -Ofast)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    target_compile_options(myQATModel PRIVATE /arch:AVX2)
-    target_compile_options(speed_test PRIVATE /arch:AVX2)
-    target_compile_options(generate_image PRIVATE /arch:AVX2)
+    target_compile_options(qat_core PUBLIC /arch:AVX2)
 endif()
+
+
+#-----------------------------------------------------------------------------
+# 2. 构建可执行文件，并链接到核心库 🔗
+#-----------------------------------------------------------------------------
+
+# --- 构建主应用程序 ---
+add_executable(myQATModel
+    src/main.cpp
+)
+target_link_libraries(myQATModel PRIVATE qat_core)
+
+# --- 构建速度测试程序 ---
+add_executable(speed_test
+    src/speed_test.cpp
+)
+target_link_libraries(speed_test PRIVATE qat_core)
+
+# --- 构建图像生成程序 ---
+add_executable(generate_image 
+    src/generate_image.cpp
+    src/qat_unet_model.cpp  # 这个源文件是此目标特有的
+)
+target_link_libraries(generate_image PRIVATE qat_core)

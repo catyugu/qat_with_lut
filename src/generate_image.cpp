@@ -8,13 +8,53 @@
 #include <cmath>
 #include <stdexcept>
 #include <filesystem> // For creating directory
-#include <iomanip>    // For std::setfill, std::setw
+#include <iomanip>    // For std::setfill, std::setw, std::fixed, std::setprecision
 #include "qat_unet_model.h"
 #include "utils.h"
 #include "kernels.h"
 #include "stb_image_write.h"
 #include "profiler.h"
 
+// --- Helper function to unpack and print weights ---
+void verify_final_conv_weights(const QATConv2dLayer& layer) {
+    if (layer.out_channels != 3) {
+        std::cerr << "Verification Error: final_conv is not producing 3 channels!" << std::endl;
+        return;
+    }
+
+    std::cout << "--- C++ Model: Final Convolution Layer Verification ---" << std::endl;
+    
+    // 1. 打印偏置 (Bias)
+    if (!layer.bias.empty()) {
+        std::cout << std::fixed << std::setprecision(8);
+        std::cout << "Bias (R, G, B): [" << layer.bias[0] << ", " << layer.bias[1] << ", " << layer.bias[2] << "]" << std::endl;
+    }
+
+    // 2. 解包并打印每个输出通道的前5个权重
+    const int K = layer.in_channels * layer.kernel_size_h * layer.kernel_size_w;
+    
+    for (int c_out = 0; c_out < 3; ++c_out) {
+        std::string channel_name = (c_out == 0) ? "RED" : ((c_out == 1) ? "GREEN" : "BLUE");
+        std::cout << "Weight for " << std::setw(5) << channel_name << " (Channel " << c_out << ", first 5): [";
+
+        for (int k = 0; k < 5; ++k) {
+            if (k >= K) break; // 防止越界
+            
+            // 手动执行与GEMM中完全相同的解包逻辑
+            const size_t weight_idx_flat = c_out * K + k;
+            const size_t packed_word_idx = weight_idx_flat / 16;
+            const uint32_t packed_word = layer.packed_weights[packed_word_idx];
+            const size_t inner_idx = weight_idx_flat % 16;
+            const size_t bit_shift = inner_idx * 2;
+            const uint8_t two_bit_val = (packed_word >> bit_shift) & 0x03;
+            const float w = (two_bit_val == 1) ? 1.0f : ((two_bit_val == 2) ? -1.0f : 0.0f);
+            
+            std::cout << w << ((k == 4) ? "" : ", ");
+        }
+        std::cout << "]" << std::endl;
+    }
+    std::cout << "---------------------------------------------------------" << std::endl;
+}
 // Defines all necessary diffusion coefficients
 struct DiffusionConstants {
     int num_timesteps;
@@ -60,6 +100,38 @@ DiffusionConstants setup_diffusion_constants(int timesteps, float beta_start = 0
 }
 
 
+// =================================================================================
+// <<< NEW HELPER FUNCTION TO PRINT CHANNEL MEANS >>>
+// =================================================================================
+void print_channel_means(const Tensor& tensor, int timestep) {
+    if (tensor.shape.size() != 4 || tensor.shape[1] != 3) {
+        // Silently ignore if not a 3-channel image tensor
+        return;
+    }
+
+    const size_t num_pixels_per_channel = tensor.shape[2] * tensor.shape[3];
+    if (num_pixels_per_channel == 0) return;
+
+    std::vector<double> sums = {0.0, 0.0, 0.0}; // Use double for precision in sum
+
+    // The data is in NCHW format
+    for (size_t c = 0; c < 3; ++c) {
+        for (size_t i = 0; i < num_pixels_per_channel; ++i) {
+            sums[c] += tensor.data[c * num_pixels_per_channel + i];
+        }
+    }
+    
+    // Set up nice formatting for cout
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "  [t =" << std::setw(4) << timestep << "] Channel Means -> R: " << std::setw(10) << sums[0] / num_pixels_per_channel
+              << " | G: " << std::setw(10) << sums[1] / num_pixels_per_channel
+              << " | B: " << std::setw(10) << sums[2] / num_pixels_per_channel << std::endl;
+    // Reset cout formatting to default
+    std::cout.unsetf(std::ios_base::floatfield);
+    std::cout << std::defaultfloat;
+}
+
+
 int main(int argc, char* argv[]) {
     if (argc != 5) {
         std::cerr << "Usage: " << argv[0] << " <path_to_ema_model.bin> <class_label> <num_timesteps> <output_image.png>" << std::endl;
@@ -90,7 +162,9 @@ int main(int argc, char* argv[]) {
         // 1. Load the UNet model (ensure this is from the EMA weights)
         QATUNetModel model;
         model.load_model(model_path);
-        std::cout << "Successfully loaded EMA model and LUT." << std::endl;
+        std::cout << "Successfully loaded EMA model." << std::endl;
+
+        verify_final_conv_weights(*model.final_conv);
 
         // 2. Setup diffusion constants EXACTLY as in the Python script
         DiffusionConstants dc = setup_diffusion_constants(num_timesteps, 1e-4f, 0.02f);
@@ -117,7 +191,8 @@ int main(int argc, char* argv[]) {
             class_tensor.data[0] = static_cast<float>(class_label);
             // Predict noise using the UNet model
             Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor, class_tensor);
-
+            std::cout << "  [PREDICTED NOISE] ";
+            print_channel_means(predicted_noise, t);
             // --- Core Denoising Logic (Mirrors python `remove_noise`) ---
             // 1. Get coefficients for the current timestep t
             float remove_coeff = dc.remove_noise_coeff[t];
@@ -130,6 +205,18 @@ int main(int argc, char* argv[]) {
             image_tensor = denoised_term.mul_scalar(recip_sqrt_alpha);
             // --- End of Core Denoising Logic ---
 
+            // Add new noise if not the final step (t > 0)
+            if (t > 0) {
+                float sigma_t = dc.sigma[t];
+                Tensor noise_tensor = Tensor::randn_like(image_tensor.shape); // Helper for random noise
+                image_tensor = image_tensor.add(noise_tensor.mul_scalar(sigma_t));
+            }
+            
+            // =================================================================================
+            // <<< PRINT CHANNEL MEANS AFTER FULL UPDATE FOR THIS TIMESTEP >>>
+            // =================================================================================
+            print_channel_means(image_tensor, t);
+
             // Save image every 10 diffusion steps, and at the last step (t=0)
             if ((num_timesteps - 1 - t) % 10 == 0 || t == 0) {
                 std::string step_image_filename = output_dir + "/step_" + std::to_string(num_timesteps - 1 - t) + ".png";
@@ -139,13 +226,6 @@ int main(int argc, char* argv[]) {
                     std::cout << "Intermediate image saved to " << step_image_filename << std::endl;
                 }
             }
-            // Add new noise if not the final step (t > 0)
-            if (t > 0) {
-                float sigma_t = dc.sigma[t];
-                Tensor noise_tensor = Tensor::randn_like(image_tensor.shape); // Helper for random noise
-                image_tensor = image_tensor.add(noise_tensor.mul_scalar(sigma_t));
-            }
-
         }
         std::cout << "Sampling complete." << std::endl;
         

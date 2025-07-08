@@ -11,8 +11,19 @@
 #include <algorithm>
 #include <functional>
 #include <random>
+#include <iostream>
 #include <immintrin.h>
+#include <cstring>
 // --- 模型数据结构 ---
+inline std::string shape_to_string(const std::vector<size_t>& shape) {
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        s += std::to_string(shape[i]) + (i == shape.size() - 1 ? "" : ", ");
+    }
+    s += "]";
+    return s;
+}
+
 struct FloatLayer {
     std::vector<float> weights;
     std::vector<float> bias;
@@ -154,136 +165,186 @@ struct Tensor {
         return total;
     }
     // Helper to calculate flat index from multi-dimensional indices
-    size_t get_index(std::initializer_list<size_t> indices) const {
+    size_t get_index(const std::vector<size_t>& indices) const {
         if (indices.size() != shape.size()) {
-            throw std::out_of_range("Index dimension mismatch");
+            throw std::out_of_range("Index dimension mismatch.");
         }
         size_t index = 0;
         size_t stride = 1;
-        auto it = indices.end();
-        auto shape_it = shape.end();
-        while (it != indices.begin()) {
-            --it;
-            --shape_it;
-            index += (*it) * stride;
-            stride *= (*shape_it);
+        for (int i = shape.size() - 1; i >= 0; --i) {
+            if (indices[i] >= shape[i]) {
+                throw std::out_of_range("Index out of bounds.");
+            }
+            index += indices[i] * stride;
+            stride *= shape[i];
         }
         return index;
     }
 
     // Multi-dimensional accessors
-    float& at(std::initializer_list<size_t> indices) {
+    float& at(const std::vector<size_t>& indices) {
         return data[get_index(indices)];
     }
-    const float& at(std::initializer_list<size_t> indices) const {
+    const float& at(const std::vector<size_t>& indices) const {
         return data[get_index(indices)];
     }
 
+
     // Tensor manipulation methods
-    Tensor mul_scalar(float val) const {
-        Tensor result = *this;
-        for (size_t i = 0; i < data.size(); ++i) { result.data[i] *= val; }
+    Tensor mul_scalar(float s) const {
+        Tensor result(this->shape);
+        for (size_t i = 0; i < this->data.size(); ++i) {
+            result.data[i] = this->data[i] * s;
+        }
         return result;
     }
+
     
     Tensor sub(const Tensor& other) const {
-        if (data.size() != other.data.size()) throw std::runtime_error("Tensor shapes must match for subtraction.");
-        Tensor result = *this;
-        for (size_t i = 0; i < data.size(); ++i) { result.data[i] -= other.data[i]; }
+        if (this->shape != other.shape) {
+            throw std::runtime_error("Tensor::sub requires identical shapes.");
+        }
+        Tensor result(this->shape);
+        for (size_t i = 0; i < this->data.size(); ++i) {
+            result.data[i] = this->data[i] - other.data[i];
+        }
         return result;
     }
 
     Tensor add(const Tensor& other) const {
-        // Supports broadcasting for shapes like {B,C,H,W} + {1,C,1,1}
-        if (data.size() == other.data.size()) {
-            Tensor result = *this;
-            for (size_t i = 0; i < data.size(); ++i) { result.data[i] += other.data[i]; }
+        // Case 1: Element-wise Addition (Shapes are identical)
+        if (this->shape == other.shape) {
+            Tensor result(this->shape);
+            for (size_t i = 0; i < this->data.size(); ++i) {
+                result.data[i] = this->data[i] + other.data[i];
+            }
             return result;
-        } else {
-             Tensor result = *this;
-             for(size_t b = 0; b < shape[0]; ++b) {
-                for(size_t c = 0; c < shape[1]; ++c) {
-                    float other_val = other.at({0, c, 0, 0});
-                    for(size_t h = 0; h < shape[2]; ++h) {
-                        for(size_t w = 0; w < shape[3]; ++w) {
-                            result.at({b, c, h, w}) += other_val;
-                        }
+        }
+
+        // Case 2: 4D + 1D Broadcast (Conv2D bias: [B,C,H,W] + [C])
+        if (this->shape.size() == 4 && other.shape.size() == 1 && this->shape[1] == other.shape[0]) {
+            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
+            Tensor result(this->shape);
+            for (size_t b = 0; b < B; ++b) {
+                for (size_t c = 0; c < C; ++c) {
+                    const float bias_value = other.data[c];
+                    for (size_t hw = 0; hw < H * W; ++hw) {
+                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + bias_value;
                     }
                 }
-             }
-             return result;
+            }
+            return result;
         }
+
+        // Case 3: 4D + 2D Broadcast (Time/Class embedding: [B,C,H,W] + [B,C])
+        if (this->shape.size() == 4 && other.shape.size() == 2 && this->shape[0] == other.shape[0] && this->shape[1] == other.shape[1]) {
+            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
+            Tensor result(this->shape);
+            for (size_t b = 0; b < B; ++b) {
+                for (size_t c = 0; c < C; ++c) {
+                    const float embedding_value = other.at({b, c});
+                    for (size_t hw = 0; hw < H * W; ++hw) {
+                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + embedding_value;
+                    }
+                }
+            }
+            return result;
+        }
+        
+        // ▼▼▼ NEWLY ADDED CASE ▼▼▼
+        // Case 4: 4D + 4D Broadcast (Residual connection: [B,C,H,W] + [B,C,1,1])
+        if (this->shape.size() == 4 && other.shape.size() == 4 &&
+            this->shape[0] == other.shape[0] && this->shape[1] == other.shape[1] &&
+            other.shape[2] == 1 && other.shape[3] == 1) {
+            const auto B = this->shape[0], C = this->shape[1], H = this->shape[2], W = this->shape[3];
+            Tensor result(this->shape);
+            for (size_t b = 0; b < B; ++b) {
+                for (size_t c = 0; c < C; ++c) {
+                    // The value from the [B, C, 1, 1] tensor is constant across the HxW plane.
+                    const float residual_value = other.at({b, c, 0, 0});
+                    for (size_t hw = 0; hw < H * W; ++hw) {
+                        result.data[b*C*H*W + c*H*W + hw] = this->data[b*C*H*W + c*H*W + hw] + residual_value;
+                    }
+                }
+            }
+            return result;
+        }
+
+        // --- Diagnostic Block ---
+        std::cerr << "\n\nCRITICAL ERROR: Tensor::add encountered an unhandled broadcasting scenario.\n";
+        std::cerr << "  - Shape of 'this' tensor: " << shape_to_string(this->shape) << "\n";
+        std::cerr << "  - Shape of 'other' tensor: " << shape_to_string(other.shape) << "\n\n";
+        throw std::runtime_error("Tensor::add unsupported shapes for broadcasting.");
     }
-
-    void reshape(const std::vector<size_t>& new_shape) {
-            size_t new_size = 1;
-            for (size_t dim : new_shape) {
-                new_size *= dim;
-            }
-
-            // If the new size is different, we re-allocate the data buffer.
-            // This fixes the error and makes the function more useful.
-            if (new_size != data.size()) {
-                data.resize(new_size);
-            }
-
-            // Always update the shape.
-            this->shape = new_shape;
+    Tensor concat(const Tensor& other) const {
+        if (this->shape.size() != 4 || other.shape.size() != 4) {
+            throw std::runtime_error("Tensor::concat only supports 4D tensors.");
+        }
+        // Batch, Height, and Width must be the same.
+        if (this->shape[0] != other.shape[0] || this->shape[2] != other.shape[2] || this->shape[3] != other.shape[3]) {
+            throw std::runtime_error("Tensor::concat dimensions mismatch (B, H, or W are not equal).");
         }
 
-    Tensor permute(const std::vector<size_t>& dims) const {
-        if (dims.size() != shape.size()) {
-            throw std::runtime_error("Permute error: Number of dimensions must match tensor shape.");
-        }
-        
-        // 检查 dims 是否是 {0, 1, ..., N-1} 的一个有效排列
-        std::vector<size_t> sorted_dims = dims;
-        std::sort(sorted_dims.begin(), sorted_dims.end());
-        for(size_t i = 0; i < sorted_dims.size(); ++i) {
-            if (sorted_dims[i] != i) {
-                throw std::runtime_error("Permute error: Invalid dimension specified.");
-            }
+        const size_t B = this->shape[0];
+        const size_t C1 = this->shape[1];
+        const size_t C2 = other.shape[1];
+        const size_t H = this->shape[2];
+        const size_t W = this->shape[3];
+
+        // The new tensor will have the combined number of channels.
+        Tensor result({B, C1 + C2, H, W});
+
+        const size_t plane_size = H * W;
+
+        for (size_t b = 0; b < B; ++b) {
+            // Pointer to the start of the current batch item in the source tensors.
+            const float* this_ptr = this->data.data() + b * C1 * plane_size;
+            const float* other_ptr = other.data.data() + b * C2 * plane_size;
+            // Pointer to the start of the current batch item in the destination tensor.
+            float* result_ptr = result.data.data() + b * (C1 + C2) * plane_size;
+
+            // Copy data from the first tensor ('this').
+            memcpy(result_ptr, this_ptr, C1 * plane_size * sizeof(float));
+
+            // Copy data from the second tensor ('other'), placing it right after the first tensor's data.
+            memcpy(result_ptr + C1 * plane_size, other_ptr, C2 * plane_size * sizeof(float));
         }
 
-        // 计算新的形状
-        std::vector<size_t> new_shape(shape.size());
-        for (size_t i = 0; i < dims.size(); ++i) {
-            new_shape[i] = shape[dims[i]];
-        }
-
-        Tensor result(new_shape);
-        
-        // 创建一个索引数组用于遍历
-        std::vector<size_t> old_indices(shape.size(), 0);
-        std::vector<size_t> new_indices(shape.size(), 0);
-
-        // 遍历所有元素
-        for (size_t i = 0; i < this->numel(); ++i) {
-            // 1. 从一维索引 i 计算原始的多维索引 (old_indices)
-            size_t temp_i = i;
-            for (int j = shape.size() - 1; j >= 0; --j) {
-                old_indices[j] = temp_i % shape[j];
-                temp_i /= shape[j];
-            }
-
-            // 2. 根据 permute 的 dims 映射计算新的多维索引 (new_indices)
-            for (size_t j = 0; j < dims.size(); ++j) {
-                new_indices[j] = old_indices[dims[j]];
-            }
-            
-            // 3. 将新多维索引转换为一维索引，并复制数据
-            size_t new_flat_index = 0;
-            size_t stride = 1;
-            for (int j = new_shape.size() - 1; j >= 0; --j) {
-                new_flat_index += new_indices[j] * stride;
-                stride *= new_shape[j];
-            }
-            result.data[new_flat_index] = this->data[i];
-        }
-        
         return result;
     }
-    
+    void reshape(const std::vector<size_t>& new_shape) {
+        size_t new_size = 1;
+        for (size_t dim : new_shape) new_size *= dim;
+        if (new_size != data.size()) throw std::runtime_error("Reshape size mismatch.");
+        shape = new_shape;
+    }
+
+    Tensor permute(const std::vector<int>& dims) const {
+        if (dims.size() != shape.size()) throw std::runtime_error("Permute dimensions mismatch.");
+        std::vector<size_t> new_shape(shape.size());
+        for (size_t i = 0; i < dims.size(); ++i) new_shape[i] = shape[dims[i]];
+        
+        Tensor result(new_shape);
+        std::vector<size_t> old_indices(shape.size());
+        
+        std::function<void(size_t, size_t)> recurse = 
+            [&](size_t dim_idx, size_t current_offset) {
+            if (dim_idx == shape.size()) {
+                std::vector<size_t> new_indices(dims.size());
+                for(size_t i = 0; i < dims.size(); ++i) new_indices[i] = old_indices[dims[i]];
+                result.at(new_indices) = data[current_offset];
+            } else {
+                size_t stride = 1;
+                for(size_t i = dim_idx + 1; i < shape.size(); ++i) stride *= shape[i];
+                for(size_t i = 0; i < shape[dim_idx]; ++i) {
+                    old_indices[dim_idx] = i;
+                    recurse(dim_idx + 1, current_offset + i * stride);
+                }
+            }
+        };
+        recurse(0, 0);
+        return result;
+    }
     Tensor transpose(size_t dim1, size_t dim2) const {
         // Simplified transpose for matmul
         if (shape.size() == 3 && dim1 == 1 && dim2 == 2) {
@@ -537,16 +598,24 @@ struct Tensor {
         target_dim *= 2;
     }
 
-    // --- Generate Hadamard Matrix (more efficient) ---
     std::vector<float> h_matrix(target_dim * target_dim);
-    h_matrix[0] = 1.0f;
-    for (size_t n = 1; n < target_dim; n *= 2) {
-        for (size_t i = 0; i < n; ++i) {
-            for (size_t j = 0; j < n; ++j) {
-                float val = h_matrix[i * n + j];
-                h_matrix[i * (n * 2) + (j + n)] = val;
-                h_matrix[(i + n) * (n * 2) + j] = val;
-                h_matrix[(i + n) * (n * 2) + (j + n)] = -val;
+    if (target_dim > 0) {
+        h_matrix[0] = 1.0f;
+        for (size_t n = 1; n < target_dim; n *= 2) {
+            // 创建一个当前矩阵的副本以从中读取
+            std::vector<float> h_prev_chunk(h_matrix.begin(), h_matrix.begin() + n * n);
+            for (size_t i = 0; i < n; ++i) {
+                for (size_t j = 0; j < n; ++j) {
+                    float val = h_prev_chunk[i * n + j];
+                    // Top-left quadrant
+                    h_matrix[i * (n * 2) + j] = val;
+                    // Top-right quadrant
+                    h_matrix[i * (n * 2) + j + n] = val;
+                    // Bottom-left quadrant
+                    h_matrix[(i + n) * (n * 2) + j] = val;
+                    // Bottom-right quadrant
+                    h_matrix[(i + n) * (n * 2) + j + n] = -val;
+                }
             }
         }
     }
