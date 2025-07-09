@@ -665,7 +665,7 @@ Tensor positional_embedding(const Tensor& time, const PositionalEmbedding& layer
 Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const Tensor& time_emb, const Tensor& y) {
     PROFILE_SCOPE("residual_block");
     Tensor h = group_norm(input, *block.norm_1);
-    h = silu(h);
+    h = apply_scaled_ternary_activation(h);
     h = conv2d(h, *block.conv_1);
     if (block.time_bias) {
         Tensor silu_time_emb_output = silu(time_emb); // Capture the output of silu
@@ -685,7 +685,7 @@ Tensor residual_block(const Tensor& input, const QATResidualBlock& block, const 
         h = h.add(class_bias_tensor);
     }
     Tensor h2 = group_norm(h, *block.norm_2);
-    h2 = silu(h2);
+    h2 = apply_scaled_ternary_activation(h2);
     // The dropout layer from Python is an identity op during inference,
     // so we directly call the convolution here, which is correct.
     h2 = conv2d(h2, *block.conv_2);
