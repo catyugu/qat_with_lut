@@ -20,6 +20,8 @@ struct DiffusionConstants {
     std::vector<float> posterior_mean_coef1;
     std::vector<float> posterior_mean_coef2;
 };
+DiffusionConstants calculateDiffusionConstants(int num_timesteps, float beta_low, float beta_high); 
+
 class QATUNetModel {
 public:
     // --- Hyperparameters ---

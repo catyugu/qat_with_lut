@@ -81,6 +81,8 @@ void standard_linear_forward(
 
 Tensor conv2d(const Tensor& input, const QATConv2dLayer& layer);
 
+Tensor apply_scaled_ternary_activation(const Tensor& input);
+
 // Performs a standard linear (fully connected) layer operation
 Tensor linear(const Tensor& input, const LinearLayer& layer);
 

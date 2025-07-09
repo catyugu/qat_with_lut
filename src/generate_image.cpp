@@ -86,7 +86,7 @@ int main(int argc, char* argv[]) {
         QATUNetModel model;
         model.load_model(model_path);
 
-        DiffusionConstants dc = model.diffusion_constants;
+        DiffusionConstants dc = calculateDiffusionConstants(num_timesteps, 1e-4, 0.02);
 
         std::mt19937 gen(std::random_device{}());
         Tensor image_tensor = randn_like({1, (size_t)model.in_channels, (size_t)model.image_size, (size_t)model.image_size}, gen);
@@ -105,8 +105,7 @@ int main(int argc, char* argv[]) {
             Tensor predicted_noise = forward_qat_unet(model, image_tensor, time_tensor, class_tensor);
             
             Tensor pred_x0_term1 = predicted_noise.mul_scalar(1.0f/dc.sqrt_one_minus_alphas_cumprod[t]).mul_scalar(dc.betas[t]);
-            Tensor pred_x0_term2 = image_tensor.sub(pred_x0_term1);
-            image_tensor  = pred_x0_term2.mul_scalar(std::sqrt(1.0f / dc.alphas[t]));
+            image_tensor  = (image_tensor.sub(pred_x0_term1)).mul_scalar(std::sqrt(1.0f / dc.alphas[t]));
 
             if (t > 0) {
                 Tensor noise = randn_like(image_tensor.shape, gen);;

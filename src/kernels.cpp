@@ -564,6 +564,37 @@ Tensor group_norm(
     }
     return output_tensor;
 }
+Tensor apply_scaled_ternary_activation(const Tensor& input) {
+    PROFILE_SCOPE("scaled_ternary_act"); // 用于性能分析
+    Tensor output(input.shape); // 创建一个与输入形状相同的输出张量
+    float alpha = 0.0f;
+    size_t num_elements = input.numel();
+
+    if (num_elements == 0) return output; // 处理空张量情况
+
+    // 1. 计算 alpha (平均绝对值)
+    for (size_t i = 0; i < num_elements; ++i) {
+        alpha += std::abs(input.data[i]);
+    }
+    alpha /= num_elements; // 这就是 Python 中 torch.mean(torch.abs(input)) 的 C++ 实现
+
+    // 2. 计算阈值
+    float threshold = 0.001f * alpha;
+
+    // 3. 应用三值化逻辑并缩放
+    for (size_t i = 0; i < num_elements; ++i) {
+        float val = input.data[i];
+        if (val > threshold) {
+            output.data[i] = 1.0f;
+        } else if (val < -threshold) {
+            output.data[i] = -1.0f;
+        } else {
+            output.data[i] = 0.0f;
+        }
+        output.data[i] *= alpha; // 乘以缩放因子
+    }
+    return output;
+}
 
 Tensor attention_block(const Tensor& input, const AttentionBlock& block) {
     PROFILE_SCOPE("attention_block");

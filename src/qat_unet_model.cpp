@@ -311,3 +311,84 @@ void QATUNetModel::load_model(const std::string& model_path) {
     }
     std::cout << "Diffusion constants loaded/initialized." << std::endl;
 }
+DiffusionConstants calculateDiffusionConstants(int num_timesteps, float beta_low, float beta_high) {
+    DiffusionConstants constants;
+    constants.num_timesteps = num_timesteps;
+
+    // 预分配向量大小
+    constants.betas.reserve(num_timesteps);
+    constants.alphas.reserve(num_timesteps);
+    constants.alphas_cumprod.reserve(num_timesteps);
+    constants.sqrt_alphas_cumprod.reserve(num_timesteps);
+    constants.sqrt_one_minus_alphas_cumprod.reserve(num_timesteps);
+    constants.posterior_variance.reserve(num_timesteps);
+    constants.posterior_mean_coef1.reserve(num_timesteps);
+    constants.posterior_mean_coef2.reserve(num_timesteps);
+
+    // 1. 计算 betas (线性插值)
+    for (int i = 0; i < num_timesteps; ++i) {
+        float beta;
+        if (num_timesteps > 1) {
+            beta = beta_low + (beta_high - beta_low) * i / (static_cast<float>(num_timesteps) - 1.0f);
+        } else {
+            beta = beta_low; // num_timesteps == 1 时，beta_low 和 beta_high 应该相同
+        }
+        constants.betas.push_back(beta);
+    }
+
+    // alphas_cumprod_prev 用于后续计算，其第一个元素为 1.0
+    std::vector<float> alphas_cumprod_prev;
+    alphas_cumprod_prev.reserve(num_timesteps + 1);
+    alphas_cumprod_prev.push_back(1.0f); // T=0 时的 alpha_cumprod 为 1.0
+
+    float current_alphas_cumprod = 1.0f; // 累计乘积的初始值
+
+    for (int t = 0; t < num_timesteps; ++t) {
+        // 2. alphas = 1.0 - betas
+        float alpha = 1.0f - constants.betas[t];
+        constants.alphas.push_back(alpha);
+
+        // 3. alphas_cumprod (累计乘积)
+        current_alphas_cumprod *= alpha;
+        constants.alphas_cumprod.push_back(current_alphas_cumprod);
+        
+        // 记录当前 alphas_cumprod 为下一个 t 的 prev 值
+        if (t < num_timesteps -1) { // alphas_cumprod_prev 会比 alphas_cumprod 多一个元素
+            alphas_cumprod_prev.push_back(current_alphas_cumprod);
+        }
+    }
+
+    // 4. sqrt_alphas_cumprod
+    // 5. sqrt_one_minus_alphas_cumprod
+    for (int t = 0; t < num_timesteps; ++t) {
+        constants.sqrt_alphas_cumprod.push_back(std::sqrt(constants.alphas_cumprod[t]));
+        constants.sqrt_one_minus_alphas_cumprod.push_back(std::sqrt(1.0f - constants.alphas_cumprod[t]));
+
+        // 6. posterior_variance
+        // 公式: betas[t] * (1.0 - alphas_cumprod_prev[t]) / (1.0 - alphas_cumprod[t])
+        float denom = 1.0f - constants.alphas_cumprod[t];
+        float posterior_var = 0.0f;
+        if (denom > 1e-12f) { // 避免除以零或极小值
+            posterior_var = constants.betas[t] * (1.0f - alphas_cumprod_prev[t]) / denom;
+        }
+        constants.posterior_variance.push_back(posterior_var);
+
+        // 7. posterior_mean_coef1
+        // 公式: betas[t] * sqrt(alphas_cumprod_prev[t]) / (1.0 - alphas_cumprod[t])
+        float coef1 = 0.0f;
+        if (denom > 1e-12f) {
+            coef1 = constants.betas[t] * std::sqrt(alphas_cumprod_prev[t]) / denom;
+        }
+        constants.posterior_mean_coef1.push_back(coef1);
+
+        // 8. posterior_mean_coef2
+        // 公式: (1.0 - alphas_cumprod_prev[t]) * sqrt(alphas[t]) / (1.0 - alphas_cumprod[t])
+        float coef2 = 0.0f;
+        if (denom > 1e-6f) {
+            coef2 = (1.0f - alphas_cumprod_prev[t]) * std::sqrt(constants.alphas[t]) / denom;
+        }
+        constants.posterior_mean_coef2.push_back(coef2);
+    }
+
+    return constants;
+}
