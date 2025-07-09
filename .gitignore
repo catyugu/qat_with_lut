@@ -3,7 +3,10 @@ build/
 datasets/
 .idea/
 *.pth
-*.bin
+DDPM/*.bin
+scripts/*.bin
+DDPM/*.pth
+scripts/*.pth
 DDPM/data
 DDPM/.gitignore
 DDPM/.README.md
