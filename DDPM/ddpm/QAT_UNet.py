@@ -183,6 +183,8 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
         self.hadamard_q = HadamardTransform(in_channels)
         self.hadamard_k = HadamardTransform(in_channels)
         self.hadamard_v = HadamardTransform(in_channels)
+        self.hadamard_out = HadamardTransform(in_channels)
+
 
 
     def forward(self, x):
@@ -207,6 +209,8 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
 
         # Reshape back and final projection using quantized convolution
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
+        out = self.hadamard_out(out) # 应用反变换
+        
         return self.to_out(out) + x
 
 
@@ -228,11 +232,7 @@ class QATResidualBlock(nn.Module):
     def forward(self, x, time_emb=None, y=None):
         h = self.norm_1(x)
 
-        if self.quantize_activations and self.training:
-            h = ScaledActivationTernary.apply(h)
-        else:
-            h = self.full_precision_activation(h)
-
+        h = ScaledActivationTernary.apply(h)
         h = self.conv_1(h)
 
         if self.time_bias is not None:
@@ -242,11 +242,7 @@ class QATResidualBlock(nn.Module):
 
         h2 = self.norm_2(h)
 
-        if self.quantize_activations and self.training:
-            h2 = ScaledActivationTernary.apply(h2)
-        else:
-            h2 = self.full_precision_activation(h2)
-
+        h2 = ScaledActivationTernary.apply(h2)  
         h2 = self.conv_2(h2)
 
         return self.attention(h2 + self.residual_connection(x))

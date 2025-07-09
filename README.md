@@ -301,15 +301,23 @@ The C++ inference engine (implemented in [generate\_image.cpp](src/generate_imag
   * **Attention Block Implementation**: The C++ `attention_block` mirrors its Python counterpart, performing group normalization, `QKV` projection using `conv2d`, and then applying the **Hadamard Transform** (implemented via `Tensor::hadamard_transform` which uses `Tensor::matmul` internally). This is followed by softmax and another `conv2d` layer.
   * **Residual Blocks**: The `residual_block` in C++ combines `group_norm`, `silu` activation (which operates on floats, indicating activations are not ternary-quantized during C++ inference for this model), `conv2d`, and incorporates time and class conditioning biases, as well as the attention block when applicable.
   * **Image Generation**: The `generate_image.cpp` executable orchestrates the reverse diffusion process, iteratively calling the `forward_qat_unet` function to denoise a random input, saving intermediate steps and the final generated image.
-
+  
 -----
 
-### 4\. Performance and Memory Benefits
+### 4\. Results
 
-By leveraging ternary weights and optimized C++ kernels, this DDPM implementation achieves significant benefits, similar to those observed in the MLP prelude:
+By leveraging ternary weights and optimized C++ kernels, this DDPM implementation achieves significant benefits:
 
   * **Reduced Model Size**: Storing weights as 2-bit values drastically cuts down the model's memory footprint, making it suitable for deployment on resource-constrained devices.
+  
+    ` qat_unet_final.pth 132M Jul  5 20:43 `
+
+    ` qat_unet_model_packed.bin 19M Jul  9 11:43 `
   * **Efficient Inference**: While not fully LUT-based like the MLP, the custom kernel still benefits from ternary weight representation and AVX2/AVX512 optimizations for faster matrix multiplication. The use of full-precision activations helps preserve model quality while still gaining significant speed over full-precision float models.
+
+At the same time, the quality of image generated is quite acceptable. The pictures shown below is respectively from class9(truck) and class 0(plane):
+
+![class9.png](results/class9.png) ![class0.png](results/class0.png)
 
 -----
 
@@ -319,13 +327,10 @@ By leveraging ternary weights and optimized C++ kernels, this DDPM implementatio
 
 Since the diffusion is highly sensitive to small numerical bias, the small loss of precision on calculating process can cause serious loss of image quality when deployed on C++. It might have caused serious channel imbalance and destroyed the image quality
 
-#### 2: Difficulty in activation quantization
+#### 2: Speed bottleneck of conv2d operator
 
-I've observed that even if trained with ternary quantized activation layer, the image quality can be much better with SiLU activation function than that with ternary quantized activation layer.
+The conv2d is called most time on reasoning, yet it is still the slowest part which result the reasoning speed to be frustrating, about 1s/iteration
 
-#### 3: Speed bottleneck of conv2d operator
-
-The conv2d is called most time on 
 -----
 ### 6\. How to Run the DDPM Project
 
