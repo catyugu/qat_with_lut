@@ -26,7 +26,7 @@ void save_tensor_to_file(const Tensor& t, const std::string& path) {
     std::ofstream file(path);
     // No need for t.contiguous() as Tensor is already a flat vector internally
     for (const auto& val : t.data) {
-        file << val << std::endl;
+        file << std::setprecision(20) << val << std::endl;
     }
 }
 

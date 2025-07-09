@@ -77,8 +77,8 @@ def get_diffusion_coefficients(num_timesteps, beta_start=0.0001, beta_end=0.02):
 
     return {
         "betas": betas,
+        "alphas": alphas,
         "alphas_cumprod": alphas_cumprod,
-        "alphas_cumprod_prev": alphas_cumprod_prev,
         "sqrt_alphas_cumprod": sqrt_alphas_cumprod,
         "sqrt_one_minus_alphas_cumprod": sqrt_one_minus_alphas_cumprod,
         "posterior_variance": posterior_variance_clipped,
@@ -258,8 +258,8 @@ def main():
         # Write each coefficient array sequentially
         # The order here MUST MATCH the reading order in C++
         write_tensor(f, coeffs["betas"])
+        write_tensor(f, coeffs["alphas"])
         write_tensor(f, coeffs["alphas_cumprod"])
-        write_tensor(f, coeffs["alphas_cumprod_prev"])
         write_tensor(f, coeffs["sqrt_alphas_cumprod"])
         write_tensor(f, coeffs["sqrt_one_minus_alphas_cumprod"])
         write_tensor(f, coeffs["posterior_variance"])

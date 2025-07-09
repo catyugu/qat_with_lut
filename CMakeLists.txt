@@ -41,7 +41,7 @@ target_link_libraries(qat_core PUBLIC
 
 # 将编译器特定优化选项也应用到核心库
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(qat_core PUBLIC -mavx2 -Ofast)
+    target_compile_options(qat_core PUBLIC -mavx2 -O2)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
     target_compile_options(qat_core PUBLIC /arch:AVX2)
 endif()

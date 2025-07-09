@@ -283,10 +283,10 @@ void QATUNetModel::load_model(const std::string& model_path) {
     read_from_file(file, this->diffusion_constants.num_timesteps, "num_timesteps");
     this->diffusion_constants.betas.resize(this->diffusion_constants.num_timesteps);
     read_vector(file, this->diffusion_constants.betas, "betas");
+    this->diffusion_constants.alphas.resize(this->diffusion_constants.num_timesteps);
+    read_vector(file, this->diffusion_constants.alphas, "alphas");
     this->diffusion_constants.alphas_cumprod.resize(this->diffusion_constants.num_timesteps);
     read_vector(file, this->diffusion_constants.alphas_cumprod, "alphas_cumprod");
-    this->diffusion_constants.alphas_cumprod_prev.resize(this->diffusion_constants.num_timesteps);
-    read_vector(file, this->diffusion_constants.alphas_cumprod_prev, "alphas_cumprod_prev");
     this->diffusion_constants.sqrt_alphas_cumprod.resize(this->diffusion_constants.num_timesteps);
     read_vector(file, this->diffusion_constants.sqrt_alphas_cumprod, "sqrt_alphas_cumprod");
     this->diffusion_constants.sqrt_one_minus_alphas_cumprod.resize(this->diffusion_constants.num_timesteps);

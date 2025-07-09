@@ -12,8 +12,8 @@
 struct DiffusionConstants {
     int num_timesteps;
     std::vector<float> betas;
+    std::vector<float> alphas;
     std::vector<float> alphas_cumprod;
-    std::vector<float> alphas_cumprod_prev;
     std::vector<float> sqrt_alphas_cumprod;
     std::vector<float> sqrt_one_minus_alphas_cumprod;
     std::vector<float> posterior_variance;
