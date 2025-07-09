@@ -209,7 +209,7 @@ class AttentionBlock(nn.Module): # Renamed from QATAttentionBlock
 
         # Reshape back and final projection using quantized convolution
         out = out.view(b, h, w, c).permute(0, 3, 1, 2)
-        out = self.hadamard_out(out) # 应用反变换
+        # out = self.hadamard_out(out) # 应用反变换
         
         return self.to_out(out) + x
 
